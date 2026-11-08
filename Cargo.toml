@@ -1,0 +1,22 @@
+[package]
+name = "openarchive"
+version = "0.1.0"
+edition = "2024"
+authors = ["Laurent Berder"]
+description = "A modern, high-performance, modular Rust-backed equivalent of 7-Zip"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+sevenz-rust = "0.6"
+zip = { version = "2.2", default-features = false, features = ["deflate", "bzip2", "time"] }
+tar = "0.4"
+flate2 = "1.0"
+bzip2 = "0.4"
+anyhow = "1.0"
+thiserror = "2.0"
+walkdir = "2.5"
+indicatif = "0.17"
+chrono = "0.4"
+eframe = "0.29"
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["jpeg", "ico"] }
