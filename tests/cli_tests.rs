@@ -463,14 +463,19 @@ fn test_zip_parallel_roundtrip() {
 }
 
 #[test]
-fn test_zip_oversized_file_streaming_fallback() {
+fn test_zip_large_file_spill_roundtrip() {
     let test_dir = "test_data_zip_bigfile";
     fs::create_dir_all(test_dir).unwrap();
 
-    // Larger than the configured batch limit: this archive must take the
-    // streaming path instead of buffering the file as a prepared batch.
-    let big = vec![0x5A; 300 * 1024];
-    fs::write(format!("{}/big.bin", test_dir), &big).unwrap();
+    // All of these exceed the configured batch limit, so each is prepared in
+    // a temporary sub-archive instead of forcing a sequential archive run.
+    let mut expected = std::collections::HashMap::new();
+    for index in 0..4u8 {
+        let name = format!("big_{index}.bin");
+        let payload = vec![index.wrapping_mul(37).wrapping_add(11); 300 * 1024];
+        fs::write(format!("{}/{}", test_dir, name), &payload).unwrap();
+        expected.insert(name, payload);
+    }
     fs::write(format!("{}/small.txt", test_dir), "small file").unwrap();
 
     let exe = env!("CARGO_BIN_EXE_openarchive");
@@ -500,10 +505,10 @@ fn test_zip_oversized_file_streaming_fallback() {
         .unwrap();
     assert!(extracted.success());
 
-    assert_eq!(
-        fs::read("out_zip_bigfile/test_data_zip_bigfile/big.bin").unwrap(),
-        big
-    );
+    for (name, payload) in &expected {
+        let path = format!("out_zip_bigfile/test_data_zip_bigfile/{}", name);
+        assert_eq!(&fs::read(&path).unwrap(), payload, "mismatch in {}", path);
+    }
     assert_eq!(
         fs::read_to_string("out_zip_bigfile/test_data_zip_bigfile/small.txt").unwrap(),
         "small file"

@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufWriter, Cursor, Seek, Write, copy, sink};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Cursor, ErrorKind, Seek, Write, copy, sink};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
@@ -30,6 +30,51 @@ struct ZipItem {
     path: PathBuf,
     name: String,
     size: u64,
+}
+
+/// A prepared batch that was larger than the in-memory batch budget and was
+/// spilled to a temporary sub-archive.
+struct TempBatch {
+    path: PathBuf,
+}
+
+impl Drop for TempBatch {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+enum PreparedBatch {
+    Memory(Cursor<Vec<u8>>),
+    Temp(TempBatch),
+}
+
+static TEMP_BATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn create_temp_batch_file() -> io::Result<(PathBuf, File)> {
+    for _ in 0..64 {
+        let path = std::env::temp_dir().join(format!(
+            "openarchive-zip-{}-{}.tmp",
+            std::process::id(),
+            TEMP_BATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(io::Error::new(
+        ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary ZIP batch file",
+    ))
 }
 
 fn zip_batch_limit(num_threads: usize) -> u64 {
@@ -281,24 +326,38 @@ impl ArchiveReader for ZipHandler {
     }
 }
 
+fn write_zip_batch<W: Write + Seek>(
+    writer: &mut ZipWriter<W>,
+    batch: &[ZipItem],
+    file_options: SimpleFileOptions,
+) -> Result<()> {
+    for item in batch {
+        writer.start_file(item.name.clone(), file_options)?;
+        file_io::copy_file_to(&item.path, item.size, writer)?;
+    }
+    Ok(())
+}
+
 /// Compress ZIP batches on a worker pool and merge them in archive order.
 ///
-/// Each worker prepares a complete sub-archive in memory. A sliding window
-/// prevents workers from running more than `worker_count` batches ahead of the
-/// merger, so the reorder buffer can never grow beyond the in-flight batch
-/// budget; batches are themselves size-limited by the caller.
+/// Each worker prepares a complete sub-archive. Batches larger than the
+/// in-memory batch budget are written to temporary files instead of `Vec`s, so
+/// large files can still be compressed in parallel without unbounded RAM. A
+/// sliding window prevents workers from running more than `worker_count`
+/// batches ahead of the merger.
 fn push_parallel_batches<W: Write + Seek>(
     writer: &mut ZipWriter<W>,
     batches: Vec<Vec<ZipItem>>,
     file_options: SimpleFileOptions,
     worker_count: usize,
+    spill_threshold: u64,
 ) -> Result<()> {
     let worker_count = worker_count.min(batches.len()).max(1);
     let next_idx = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let pushed_gate = Mutex::new(0usize);
     let pushed_cv = Condvar::new();
-    let (tx, rx) = mpsc::sync_channel::<(usize, Result<Cursor<Vec<u8>>>)>(worker_count);
+    let (tx, rx) = mpsc::sync_channel::<(usize, Result<PreparedBatch>)>(worker_count);
 
     let cancel = || {
         failed.store(true, Ordering::Relaxed);
@@ -340,18 +399,26 @@ fn push_parallel_batches<W: Write + Seek>(
                     }
 
                     let batch = &batches[idx];
-                    let res: Result<Cursor<Vec<u8>>> = (|| {
-                        // Do not reserve the whole uncompressed size up front:
-                        // compressible data needs far less, and the Vec will
-                        // grow as needed.
-                        let initial_capacity = (batch_bytes(batch) as usize).min(4 * 1024 * 1024);
-                        let cursor = Cursor::new(Vec::with_capacity(initial_capacity));
-                        let mut sub_writer = ZipWriter::new(cursor);
-                        for item in batch {
-                            sub_writer.start_file(item.name.clone(), file_options)?;
-                            file_io::copy_file_to(&item.path, item.size, &mut sub_writer)?;
+                    let res: Result<PreparedBatch> = (|| {
+                        if batch_bytes(batch) > spill_threshold {
+                            let (path, file) = create_temp_batch_file()?;
+                            let temp = TempBatch { path };
+                            let mut sub_writer = ZipWriter::new(file);
+                            write_zip_batch(&mut sub_writer, batch, file_options)?;
+                            let file = sub_writer.finish()?;
+                            drop(file);
+                            Ok(PreparedBatch::Temp(temp))
+                        } else {
+                            // Do not reserve the whole uncompressed size up
+                            // front: compressible data needs far less, and the
+                            // Vec will grow as needed.
+                            let initial_capacity =
+                                (batch_bytes(batch) as usize).min(4 * 1024 * 1024);
+                            let cursor = Cursor::new(Vec::with_capacity(initial_capacity));
+                            let mut sub_writer = ZipWriter::new(cursor);
+                            write_zip_batch(&mut sub_writer, batch, file_options)?;
+                            Ok(PreparedBatch::Memory(sub_writer.finish()?))
                         }
-                        Ok(sub_writer.finish()?)
                     })();
 
                     if tx.send((idx, res)).is_err() {
@@ -363,13 +430,13 @@ fn push_parallel_batches<W: Write + Seek>(
 
         drop(tx);
 
-        let mut pending: BTreeMap<usize, Cursor<Vec<u8>>> = BTreeMap::new();
+        let mut pending: BTreeMap<usize, PreparedBatch> = BTreeMap::new();
         let mut pushed = 0usize;
 
         while pushed < batches.len() {
             match rx.recv() {
-                Ok((idx, Ok(cursor))) => {
-                    pending.insert(idx, cursor);
+                Ok((idx, Ok(batch))) => {
+                    pending.insert(idx, batch);
                 }
                 Ok((_idx, Err(e))) => {
                     cancel();
@@ -385,10 +452,20 @@ fn push_parallel_batches<W: Write + Seek>(
                 }
             }
 
-            while let Some(cursor) = pending.remove(&pushed) {
+            while let Some(batch) = pending.remove(&pushed) {
                 let merged: Result<()> = (|| {
-                    let sub_archive = ZipArchive::new(cursor)?;
-                    writer.merge_archive(sub_archive)?;
+                    match batch {
+                        PreparedBatch::Memory(cursor) => {
+                            let sub_archive = ZipArchive::new(cursor)?;
+                            writer.merge_archive(sub_archive)?;
+                        }
+                        PreparedBatch::Temp(temp) => {
+                            let file = File::open(&temp.path)?;
+                            let sub_archive = ZipArchive::new(file)?;
+                            writer.merge_archive(sub_archive)?;
+                            drop(temp);
+                        }
+                    }
                     Ok(())
                 })();
                 if let Err(e) = merged {
@@ -517,29 +594,31 @@ impl ArchiveWriter for ZipHandler {
             .iter()
             .fold(0u64, |acc, item| acc.saturating_add(item.size));
         let max_batch_bytes = zip_batch_limit(num_threads);
-        let has_oversized_file = file_items.iter().any(|item| item.size > max_batch_bytes);
-        let use_parallel = num_threads > 1
-            && file_items.len() > 1
-            && !has_oversized_file
-            && total_size > max_batch_bytes;
+        let use_parallel = num_threads > 1 && file_items.len() > 1 && total_size > max_batch_bytes;
 
         if !use_parallel {
-            // Sequential streaming path. This also handles archives whose
-            // files are too large to buffer as a batch, so memory stays
-            // bounded regardless of input size.
+            // Sequential streaming path for small archives and single-file
+            // archives.
             for item in file_items {
                 writer.start_file(item.name, file_options)?;
                 file_io::copy_file_to(&item.path, item.size, &mut writer)?;
             }
         } else {
-            // Parallel bounded producer-consumer pipeline.
+            // Parallel bounded producer-consumer pipeline. Oversized batches
+            // spill to temporary files instead of forcing a sequential run.
             let batches = build_batches(file_items, max_batch_bytes);
             let max_workers_by_memory = (MAX_INFLIGHT_BYTES / max_batch_bytes).max(1) as usize;
             let worker_count = num_threads
                 .min(batches.len())
                 .min(max_workers_by_memory)
                 .max(1);
-            push_parallel_batches(&mut writer, batches, file_options, worker_count)?;
+            push_parallel_batches(
+                &mut writer,
+                batches,
+                file_options,
+                worker_count,
+                max_batch_bytes,
+            )?;
         }
 
         let mut output = writer.finish()?;
@@ -586,5 +665,16 @@ mod tests {
         let batches = build_batches(vec![item(0); 10], 1024);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 10);
+    }
+
+    #[test]
+    fn temp_batch_drop_removes_file() {
+        let (path, file) = create_temp_batch_file().unwrap();
+        drop(file);
+        assert!(path.exists());
+
+        let temp = TempBatch { path: path.clone() };
+        drop(temp);
+        assert!(!path.exists());
     }
 }
