@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A single oversized 7z block (for example one huge file) uses multi-threaded LZMA2 inside its own stream, with memory bounded by the chunk size.
 - ZIP compression now batches files by uncompressed bytes (and entry count), uses a sliding window to bound the reorder buffer, and streams files larger than the batch limit instead of buffering them.
 - Windows I/O: traversal uses `DirEntry` file types instead of extra metadata calls; file reads use size-aware 8 KB/256 KB buffers with `FILE_FLAG_SEQUENTIAL_SCAN`; archive writers use 1 MB output buffers; small extracted entries are written directly.
+- 7z extraction now decodes independent blocks concurrently on multi-block archives, buffering entries through a 64 MB budget and serializing disk writes on a single writer thread; single-block and flat extraction keep the ordered pipeline.
 - Memory: file copies reuse one 256 KB thread-local buffer instead of allocating per entry; 7z prepared blocks and the 7z extraction queue have explicit 256 MB / 64 MB budgets.
 - Migrated the 7z backend from `sevenz-rust` 0.6 to `sevenz-rust2` 0.25.
 

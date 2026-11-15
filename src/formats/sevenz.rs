@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use sevenz_rust2::encoder_options::{AesEncoderOptions, EncoderOptions, Lzma2Options};
 use sevenz_rust2::{
-    ArchiveEntry as SzEntry, ArchiveReader as SzReader, ArchiveWriter as SzWriter,
+    ArchiveEntry as SzEntry, ArchiveReader as SzReader, ArchiveWriter as SzWriter, BlockDecoder,
     EncoderConfiguration, EncoderMethod, Password, PreparedBlock, SourceReader, prepare_block,
 };
 use std::collections::{BTreeMap, HashSet};
@@ -47,6 +47,10 @@ const MT_CHUNK_SIZE: u64 = 32 * MB;
 /// Maximum bytes buffered by the 7z extraction queue. Limits the producer
 /// ahead of the writer pool regardless of thread count or item size.
 const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Entries at or below this size are buffered for the single writer thread in
+/// the parallel block-decoding path. Larger entries stream directly.
+const MAX_BUFFERED_ENTRY: u64 = 32 * MB;
 
 struct ByteBudget {
     capacity: usize,
@@ -175,7 +179,7 @@ impl ArchiveReader for SevenZHandler {
             .map(Password::from)
             .unwrap_or_else(Password::empty);
 
-        let mut reader = SzReader::open(&self.path, pass)
+        let mut reader = SzReader::open(&self.path, pass.clone())
             .with_context(|| format!("Failed to open 7z archive: {}", self.path.display()))?;
 
         // 1. Directory pre-creation up front: avoid per-file filesystem collision & overhead
@@ -218,6 +222,21 @@ impl ArchiveReader for SevenZHandler {
                     .unwrap_or(1)
             })
             .max(1);
+
+        let block_count = reader.archive().blocks.len();
+        if num_threads > 1 && block_count > 1 && !options.flat {
+            // Independent blocks can be decoded in parallel. Flat extraction
+            // stays on the ordered path because duplicate basenames would race.
+            drop(reader);
+            return extract_blocks_parallel(
+                &self.path,
+                &pass,
+                block_count,
+                num_threads,
+                options,
+                filter,
+            );
+        }
 
         if num_threads <= 1 {
             // Direct extraction with buffered I/O
@@ -386,6 +405,172 @@ impl ArchiveReader for SevenZHandler {
 
         Ok(())
     }
+}
+
+/// Decode independent 7z blocks concurrently while serializing file writes.
+///
+/// Decoding a block is CPU-bound and scales well across blocks, but writing
+/// many files concurrently is slower on Windows with real-time antivirus
+/// scanning. Decode workers therefore buffer complete entries and a single
+/// writer thread performs the disk writes; memory is bounded by the same byte
+/// budget used by the regular extraction pipeline.
+fn extract_blocks_parallel(
+    archive_path: &Path,
+    password: &Password,
+    block_count: usize,
+    num_threads: usize,
+    options: &ExtractOptions,
+    filter: Option<&[String]>,
+) -> Result<()> {
+    let archive = sevenz_rust2::Archive::open_with_password(archive_path, password)
+        .with_context(|| format!("Failed to open 7z archive: {}", archive_path.display()))?;
+
+    // One thread is reserved for the writer so disk writes do not contend.
+    let decode_workers = num_threads.saturating_sub(1).max(1).min(block_count);
+    let next_block = AtomicUsize::new(0);
+    let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let budget = Arc::new(ByteBudget::new(MAX_QUEUED_BYTES));
+    let write_lock = Mutex::new(());
+    let (tx, rx) = mpsc::sync_channel::<(PathBuf, Vec<u8>, usize)>(4);
+
+    std::thread::scope(|scope| {
+        // Single writer thread.
+        {
+            let first_err = &first_err;
+            let budget = budget.clone();
+            let write_lock = &write_lock;
+            scope.spawn(move || {
+                while let Ok((target_path, data, reserved)) = rx.recv() {
+                    if first_err.lock().unwrap().is_some() {
+                        budget.release(reserved);
+                        break;
+                    }
+
+                    let result = {
+                        let _guard = write_lock.lock().unwrap();
+                        file_io::write_buffer(&target_path, &data)
+                    };
+                    budget.release(reserved);
+
+                    if let Err(e) = result {
+                        {
+                            let mut guard = first_err.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(e.into());
+                            }
+                        }
+                        budget.wake_all();
+                        break;
+                    }
+                }
+            });
+        }
+
+        for _ in 0..decode_workers {
+            let archive = &archive;
+            let first_err = &first_err;
+            let next_block = &next_block;
+            let tx = tx.clone();
+            let budget = budget.clone();
+            let write_lock = &write_lock;
+
+            scope.spawn(move || {
+                let mut source = match File::open(archive_path) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        let mut guard = first_err.lock().unwrap();
+                        if guard.is_none() {
+                            *guard = Some(e.into());
+                        }
+                        budget.wake_all();
+                        return;
+                    }
+                };
+
+                loop {
+                    if first_err.lock().unwrap().is_some() {
+                        break;
+                    }
+
+                    let block_index = next_block.fetch_add(1, Ordering::Relaxed);
+                    if block_index >= block_count {
+                        break;
+                    }
+
+                    let decoder = BlockDecoder::new(1, block_index, archive, password, &mut source);
+                    let result = decoder.for_each_entries(&mut |entry, stream| {
+                        if first_err.lock().unwrap().is_some() {
+                            return Ok(false);
+                        }
+
+                        let name = entry.name();
+                        if let Some(filters) = filter {
+                            if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
+                                return Ok(true);
+                            }
+                        }
+
+                        if !entry.is_directory() {
+                            let target_path = if options.flat {
+                                let file_name = Path::new(name).file_name().unwrap_or_default();
+                                options.output_dir.join(file_name)
+                            } else {
+                                options.output_dir.join(name)
+                            };
+
+                            if entry.size() <= MAX_BUFFERED_ENTRY {
+                                let reserved = entry.size() as usize;
+                                if !budget.reserve(reserved, &first_err) {
+                                    return Ok(false);
+                                }
+
+                                let mut data = Vec::with_capacity(reserved);
+                                if let Err(e) = stream.read_to_end(&mut data) {
+                                    budget.release(reserved);
+                                    return Err(e.into());
+                                }
+
+                                if tx.send((target_path, data, reserved)).is_err() {
+                                    budget.release(reserved);
+                                    return Ok(false);
+                                }
+                            } else {
+                                // Very large entries are streamed under the
+                                // same write lock so they do not race the
+                                // writer thread.
+                                let _guard = write_lock.lock().unwrap();
+                                if first_err.lock().unwrap().is_some() {
+                                    return Ok(false);
+                                }
+                                file_io::copy_to_file(stream, &target_path, entry.size())?;
+                            }
+                        }
+
+                        Ok(true)
+                    });
+
+                    if let Err(e) = result {
+                        {
+                            let mut guard = first_err.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(e.into());
+                            }
+                        }
+                        budget.wake_all();
+                        break;
+                    }
+                }
+            });
+        }
+
+        drop(tx);
+    });
+
+    if let Some(err) = first_err.into_inner().unwrap() {
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 /// One file queued for compression, with its already-built 7z entry.

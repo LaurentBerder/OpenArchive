@@ -107,7 +107,7 @@ The initial inspection found that the ZIP handler selected Stored for level 0 bu
 The initial inspection found sequential file processing in the archive handlers. That finding has since been addressed by the Priority 2 work:
 
 - 7z compression groups input files into solid blocks and encodes the blocks concurrently with `sevenz-rust2` (`prepare_block` / `push_prepared_block`), appending them in archive order from the writer thread. A single oversized block falls back to multi-threaded LZMA2 inside its own stream.
-- 7z extraction decodes on one thread and writes small/medium files through a bounded worker pipeline.
+- 7z extraction decodes independent blocks concurrently on multi-block archives, using a bounded decode queue and a single serialized writer; single-block and flat archives keep the decode/write pipeline.
 - ZIP compression and extraction use bounded worker pipelines.
 - TAR remains sequential because it is a streaming format; it should not be described as parallel.
 
@@ -412,7 +412,7 @@ No numerical performance advantage should be claimed until the benchmark has bee
   - **Interoperability:** every generated archive passed `7z t`; 7-Zip extraction hashes matched the source in both directions (OpenArchive → 7-Zip and 7-Zip → OpenArchive); multi-block encrypted archives also round-tripped correctly.
 - [x] **Introduce bounded producer/consumer pipelines:** Built bounded producer/consumer channels (`mpsc::sync_channel`) for compression and extraction. ZIP compression batches files by uncompressed size (`min(32 MB, 256 MB / threads)`, at most 256 entries per batch), and a sliding window stops workers from racing more than `worker_count` batches ahead of the merger, so the reorder buffer cannot grow with archive size. In-flight uncompressed batch data is capped at 256 MB; files larger than the batch limit fall back to the streaming sequential writer, so they are never prepared in memory. The 7z extraction pipeline decouples LZMA2 stream decoding from concurrent file writes up to an 8 MB threshold per item.
   - **Preliminary validation:** a 256 MB ZIP dataset (256 × 1 MB random files) passed `7z t` and both extraction hash checks. Peak working set was 9.7 MB at `-mmt=1`, ~341 MB at `-mmt=8`, and 265 MB at `-mmt=12` (batch size shrinks with thread count to stay within the 256 MB in-flight budget).
-- [x] **Investigate parallel extraction:** Implemented parallel random-access extraction for ZIP archives using scoped worker threads, independent `ZipArchive` file handles (zero lock contention), and dynamic work distribution via `AtomicUsize`. Wired thread configuration switch (`-mmt`) directly into `ExtractOptions.threads`.
+- [x] **Investigate parallel extraction:** Implemented parallel random-access extraction for ZIP archives using scoped worker threads, independent `ZipArchive` file handles (zero lock contention), and dynamic work distribution via `AtomicUsize`. For 7z, multi-block archives decode independent blocks concurrently with `BlockDecoder`; decode workers buffer entries and a single writer thread serializes disk writes, while single-block archives and flat extraction keep the ordered pipeline. Wired thread configuration switch (`-mmt`) into `ExtractOptions.threads`.
 - [x] **Parallelize independent file operations where safe:** Added upfront directory coverage and sequential pre-creation for 7z and ZIP handlers, eliminating directory races and redundant filesystem metadata lookups during parallel file writing. Integrated size-aware buffering (8 KB small reads, 256 KB sequential, 1 MB archive output) across all handlers. TAR remains sequential by design because the format is streamed; it should not be described as parallel.
 
 ### Priority 3: Windows I/O [COMPLETED]
@@ -502,7 +502,7 @@ The following tables should be populated with actual measurements.
 
 The source-code investigation suggests that 7-Zip still has advantages in compression-engine maturity and Windows-specific optimization. OpenArchive now exposes the main compression settings and compresses 7z solid blocks in parallel.
 
-All implementation priorities are complete. The full benchmark matrix remains to be run.
+All implementation priorities are complete; §15 lists the remaining beyond-roadmap opportunities. The full benchmark matrix remains to be run.
 
 These findings do not establish actual performance ratios.
 
@@ -512,7 +512,51 @@ The main engineering conclusion is that Rust itself is not the limiting factor. 
 
 ---
 
-## 15. References
+## 15. Remaining Optimization Opportunities
+
+Priority 1–4 are complete. The following work is beyond the original roadmap, ordered roughly by expected value.
+
+### 15.1 7z multi-block extraction [COMPLETED]
+
+Parallel extraction now decodes independent 7z blocks concurrently with `sevenz-rust2`'s `BlockDecoder`. Each decode worker owns an archive file handle; decoded entries up to 32 MB are buffered through the existing 64 MB byte budget and written by a single writer thread, avoiding the concurrent-write regression observed with real-time antivirus enabled. Larger entries stream directly under the writer lock. Single-block archives and flat extraction keep the ordered decode/write pipeline.
+
+- **Pure decode scaling** (128 MB text archive, 8 blocks): 0.157 s sequential → 0.019 s with 8 decode workers (8.3×).
+- **Wall-clock extraction** (8 × 16 MB entries, `-mmt=8`, three runs): text median 2.45 s → 2.22 s; random median 2.39 s → 2.08 s. The modest wall gain reflects the single-writer/Defender-bound output path; the CPU-side gain is much larger.
+- **Interoperability:** encrypted multi-block archives, 7-Zip-created 8-block (`-ms=off`) archives, filtered extraction, and flat extraction all round-trip correctly.
+- **Caveat:** each decode worker allocates its own decoder dictionary/model, so memory scales with worker count and dictionary size. The 64 MB queue budget does not bound those decoder structures.
+
+### 15.2 Encoder-memory-aware 7z scheduling
+
+The prepared-block budget bounds buffered output, not LZMA2 encoder memory. Peak 7z compression was 103 MB at `-mmt=1`, 898 MB at `-mmt=8`, 1,062 MB at `-mmt=12` (`-mx=5`), and 1,831 MB at `-mx=9 -mmt=8` on 128 MB of random data. The next step is an estimated encoder-memory budget that reduces worker count at high levels/dictionaries, or an explicit memory-limit option. This trades speed for predictable memory on low-RAM machines.
+
+### 15.3 ZIP large-file parallelism
+
+ZIP compression falls back to the sequential streaming writer for files larger than the per-thread batch limit (~21–32 MB), so datasets of large files lose cross-file parallel compression. Spilling prepared batches to temporary files would preserve parallelism while keeping RAM bounded, at the cost of additional disk I/O.
+
+### 15.4 TAR family
+
+TAR creation still goes through `tar::Builder::append_path_with_name`, which opens and copies files internally instead of using the shared I/O helpers. TAR extraction is sequential by format design. TAR.GZ and TAR.BZ2 compression are single-threaded (`flate2` / `bzip2`); a pigz-style multi-member gzip implementation or a faster backend is a separate project.
+
+### 15.5 Deeper Windows I/O
+
+The low-risk wins are implemented: file-type traversal, `FILE_FLAG_SEQUENTIAL_SCAN`, adaptive 8 KB/256 KB buffers, and 1 MB archive output buffers. Further work would need benchmark evidence:
+
+- Overlapped/asynchronous I/O for network or high-latency storage.
+- Memory-mapped reads for very large single files.
+- Larger or batched directory enumeration.
+- Windows-specific copy paths for store-mode archives.
+
+### 15.6 Micro-allocations
+
+The allocation harness still reports thousands of allocations for a few hundred files, mostly path and entry metadata allocations. Path/name pooling or a different entry representation could reduce them, but the small-archive gain is likely modest; the Priority 4 harness makes the effect measurable.
+
+### 15.7 Full benchmark matrix
+
+The largest missing piece is still the empirical benchmark: datasets A–E, 7-Zip comparisons, cross-extraction, thread scaling, and memory tables in §13 are all TBD. That data should determine which of the above opportunities matters most for the project goals.
+
+---
+
+## 16. References
 
 - [7-Zip GitHub repository](https://github.com/ip7z/7zip)
 - [OpenArchive GitHub repository](https://github.com/LaurentBerder/OpenArchive)

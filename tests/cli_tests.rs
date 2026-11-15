@@ -681,7 +681,7 @@ fn test_7z_parallel_roundtrip() {
         .unwrap();
     assert!(s_test.success());
 
-    // 3. Extract with -mmt=4 (bounded producer/consumer extraction)
+    // 3. Extract with -mmt=4 (parallel block decode, serialized writer)
     let s_extract = Command::new(exe)
         .args([
             "x",
