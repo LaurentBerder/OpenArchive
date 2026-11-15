@@ -4,7 +4,7 @@
 **Benchmark type:** Research-grade  
 **Platform:** Windows  
 **Scope:** Compression, decompression, archive size, CPU, memory, and scalability  
-**Status:** Static source-code analysis completed; 7z parallel compression validated on preliminary fixtures; full empirical benchmark pending.
+**Status:** Static source-code analysis and targeted validation completed; full empirical benchmark pending.
 
 ---
 
@@ -407,12 +407,13 @@ No numerical performance advantage should be claimed until the benchmark has bee
 - [x] **Configure thread counts:** Added `-mmt={N|on|off}` CLI switch and exposed `threads` in `CompressionOptions`.
 - [x] **Configure ZIP compression levels:** Passed compression level directly to `SimpleFileOptions::compression_level(...)` for Deflated and selected Stored for level 0.
 
-### Priority 2: Parallel processing [IN PROGRESS]
+### Priority 2: Parallel processing [COMPLETED]
 
 - [x] **Parallel LZMA2 compression (7z):** Replaced `sevenz-rust` 0.6 with `sevenz-rust2` 0.25. Files are grouped into solid blocks targeting 64 MB; a file that does not fit forms a block of its own. Each block is encoded on a scoped worker thread with `prepare_block` and appended in archive order with `push_prepared_block`. A sliding window limits workers to `N` blocks ahead of the writer, and prepared blocks are capped at 256 MB, so in-flight memory is bounded by the worker count rather than the archive size. `-mmt={N|on|off}` selects the worker count; `-mmt=1` keeps a single solid block. Blocks larger than 256 MB (for example one huge file) take the streaming path with multi-threaded LZMA2 inside their own stream, so they are never buffered whole in memory.
   - **Preliminary validation** (Ryzen 5 7600, 6C/12T, 31.1 GB RAM, NTFS SSD, 7-Zip 26.06): 128 MB random dataset (32 × 4 MB), `-mx=5`, compression time fell from 45.77 s at `-mmt=1` to 7.98 s at `-mmt=8` (5.7×) and 7.55 s at `-mmt=12` (6.1×). On a 128 MB highly compressible text dataset, 4.34 s → 1.01 s (4.3×) with the same archive size. For reference, 7-Zip took 2.76 s → 0.66 s on the text dataset, so OpenArchive reaches about 65% of 7-Zip's throughput at both 1 and 8 threads with similar scaling.
   - **Interoperability:** every generated archive passed `7z t`; 7-Zip extraction hashes matched the source in both directions (OpenArchive → 7-Zip and 7-Zip → OpenArchive); multi-block encrypted archives also round-tripped correctly.
-- [x] **Introduce bounded producer/consumer pipelines:** Built bounded producer/consumer channels (`mpsc::sync_channel`) for both compression (ZIP batch compression pipeline merging into master archive via `ZipWriter::merge_archive`) and extraction (7z extraction pipeline decoupling LZMA2 stream decoding from concurrent file disk writing up to an 8 MB threshold per item). **Known limitation:** channel capacity bounds queued messages, but the ZIP reorder buffer (`pending`) can still accumulate out-of-order batches; it is not yet bounded by bytes, so the original "strictly bounded by channel capacity" claim is inaccurate.
+- [x] **Introduce bounded producer/consumer pipelines:** Built bounded producer/consumer channels (`mpsc::sync_channel`) for compression and extraction. ZIP compression batches files by uncompressed size (`min(32 MB, 256 MB / threads)`, at most 256 entries per batch), and a sliding window stops workers from racing more than `worker_count` batches ahead of the merger, so the reorder buffer cannot grow with archive size. In-flight uncompressed batch data is capped at 256 MB; files larger than the batch limit fall back to the streaming sequential writer, so they are never prepared in memory. The 7z extraction pipeline decouples LZMA2 stream decoding from concurrent file writes up to an 8 MB threshold per item.
+  - **Preliminary validation:** a 256 MB ZIP dataset (256 × 1 MB random files) passed `7z t` and both extraction hash checks. Peak working set was 9.7 MB at `-mmt=1`, ~341 MB at `-mmt=8`, and 265 MB at `-mmt=12` (batch size shrinks with thread count to stay within the 256 MB in-flight budget).
 - [x] **Investigate parallel extraction:** Implemented parallel random-access extraction for ZIP archives using scoped worker threads, independent `ZipArchive` file handles (zero lock contention), and dynamic work distribution via `AtomicUsize`. Wired thread configuration switch (`-mmt`) directly into `ExtractOptions.threads`.
 - [x] **Parallelize independent file operations where safe:** Added upfront directory coverage and sequential pre-creation for 7z and ZIP handlers, eliminating directory races and redundant filesystem metadata lookups during parallel file writing. Integrated buffered I/O (`BufReader` / `BufWriter` with 64 KB buffers) across all archive handlers. TAR remains sequential by design because the format is streamed; it should not be described as parallel.
 
@@ -499,9 +500,8 @@ The source-code investigation suggests that 7-Zip still has advantages in compre
 
 OpenArchive has several remaining opportunities for improvement:
 
-1. Bound the ZIP compression pipeline's reorder buffer by bytes.
-2. More efficient filesystem processing.
-3. Improved memory management.
+1. More efficient filesystem processing.
+2. Improved memory management.
 
 These findings do not establish actual performance ratios.
 

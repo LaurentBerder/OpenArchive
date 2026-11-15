@@ -352,7 +352,7 @@ fn test_zip_parallel_roundtrip() {
         let content = format!(
             "Parallel test content {} - line 1\nLine 2 payload {}\n",
             i,
-            "X".repeat(500)
+            "X".repeat(100 * 1024)
         );
         fs::write(&path, &content).unwrap();
         expected_files.insert(path, content);
@@ -360,9 +360,12 @@ fn test_zip_parallel_roundtrip() {
 
     let exe = env!("CARGO_BIN_EXE_openarchive");
 
-    // 1. Create with 4 threads (bounded producer/consumer pipeline)
+    // 1. Create with 4 threads. The batch-size override yields ~15 batches,
+    // each large enough to complete out of order, so the bounded reorder
+    // window is exercised on a small fixture.
     let s_create = Command::new(exe)
         .args(["a", "archive_parallel.zip", test_dir, "-mmt=4", "-mx=6"])
+        .env("OPENARCHIVE_ZIP_BATCH_BYTES", "262144")
         .status()
         .unwrap();
     assert!(s_create.success());
@@ -403,6 +406,58 @@ fn test_zip_parallel_roundtrip() {
     let _ = fs::remove_dir_all(test_dir);
     let _ = fs::remove_dir_all("out_zip_parallel");
     let _ = fs::remove_file("archive_parallel.zip");
+}
+
+#[test]
+fn test_zip_oversized_file_streaming_fallback() {
+    let test_dir = "test_data_zip_bigfile";
+    fs::create_dir_all(test_dir).unwrap();
+
+    // Larger than the configured batch limit: this archive must take the
+    // streaming path instead of buffering the file as a prepared batch.
+    let big = vec![0x5A; 300 * 1024];
+    fs::write(format!("{}/big.bin", test_dir), &big).unwrap();
+    fs::write(format!("{}/small.txt", test_dir), "small file").unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+
+    let created = Command::new(exe)
+        .args(["a", "archive_bigfile.zip", test_dir, "-mmt=4", "-mx=6"])
+        .env("OPENARCHIVE_ZIP_BATCH_BYTES", "262144")
+        .status()
+        .unwrap();
+    assert!(created.success());
+
+    let tested = Command::new(exe)
+        .args(["t", "archive_bigfile.zip"])
+        .status()
+        .unwrap();
+    assert!(tested.success());
+
+    let extracted = Command::new(exe)
+        .args([
+            "x",
+            "archive_bigfile.zip",
+            "-o",
+            "out_zip_bigfile",
+            "-mmt=4",
+        ])
+        .status()
+        .unwrap();
+    assert!(extracted.success());
+
+    assert_eq!(
+        fs::read("out_zip_bigfile/test_data_zip_bigfile/big.bin").unwrap(),
+        big
+    );
+    assert_eq!(
+        fs::read_to_string("out_zip_bigfile/test_data_zip_bigfile/small.txt").unwrap(),
+        "small file"
+    );
+
+    let _ = fs::remove_dir_all(test_dir);
+    let _ = fs::remove_dir_all("out_zip_bigfile");
+    let _ = fs::remove_file("archive_bigfile.zip");
 }
 
 #[test]

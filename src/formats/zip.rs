@@ -1,15 +1,84 @@
+use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
-use std::io::{copy, sink, BufReader, BufWriter, Cursor, Write};
+use std::io::{BufReader, BufWriter, Cursor, Write, copy, sink};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Mutex};
-use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, mpsc};
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
+
+/// Target uncompressed size of one parallel ZIP batch. The compressed batch is
+/// held in memory until it is merged, so this value directly bounds per-worker
+/// memory.
+const DEFAULT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Cap the number of entries in one batch so many tiny files still produce
+/// reasonably sized work units without huge local-file tables.
+const MAX_BATCH_FILES: usize = 256;
+
+/// Total budget for prepared (not yet merged) batches. Batch size is derived
+/// from this budget and the requested thread count.
+const MAX_INFLIGHT_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct ZipItem {
+    path: PathBuf,
+    name: String,
+    size: u64,
+}
+
+fn zip_batch_limit(num_threads: usize) -> u64 {
+    let requested = std::env::var("OPENARCHIVE_ZIP_BATCH_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BATCH_BYTES)
+        .max(1);
+
+    // Split the in-flight budget across the requested workers instead of
+    // silently capping worker count. With the default 256 MB / 32 MB this is
+    // 8 workers; with 12 threads each batch is ~21 MB and all 12 workers run.
+    let per_worker = (MAX_INFLIGHT_BYTES / num_threads.max(1) as u64).max(1);
+
+    requested.min(per_worker).min(MAX_INFLIGHT_BYTES).max(1)
+}
+
+fn batch_bytes(batch: &[ZipItem]) -> u64 {
+    batch
+        .iter()
+        .fold(0u64, |acc, item| acc.saturating_add(item.size))
+}
+
+/// Group files by uncompressed size and entry count. Entry order is preserved.
+/// A single oversized file forms a block of its own; callers that need strict
+/// memory bounds stream such files instead of preparing them.
+fn build_batches(items: Vec<ZipItem>, max_batch_bytes: u64) -> Vec<Vec<ZipItem>> {
+    let mut batches: Vec<Vec<ZipItem>> = Vec::new();
+    let mut current: Vec<ZipItem> = Vec::new();
+    let mut current_bytes = 0u64;
+
+    for item in items {
+        let would_exceed_bytes = current_bytes.saturating_add(item.size) > max_batch_bytes;
+        let would_exceed_count = current.len() >= MAX_BATCH_FILES;
+
+        if !current.is_empty() && (would_exceed_bytes || would_exceed_count) {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+
+        current_bytes = current_bytes.saturating_add(item.size);
+        current.push(item);
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    batches
+}
 
 pub struct ZipHandler {
     path: PathBuf,
@@ -97,9 +166,14 @@ impl ArchiveReader for ZipHandler {
         }
 
         // 3. Determine parallelism
-        let num_threads = options.threads.unwrap_or_else(|| {
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-        }).max(1);
+        let num_threads = options
+            .threads
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            })
+            .max(1);
 
         let pass = options.password.as_deref().or(self.password.as_deref());
 
@@ -212,6 +286,138 @@ impl ArchiveReader for ZipHandler {
     }
 }
 
+/// Compress ZIP batches on a worker pool and merge them in archive order.
+///
+/// Each worker prepares a complete sub-archive in memory. A sliding window
+/// prevents workers from running more than `worker_count` batches ahead of the
+/// merger, so the reorder buffer can never grow beyond the in-flight batch
+/// budget; batches are themselves size-limited by the caller.
+fn push_parallel_batches(
+    writer: &mut ZipWriter<File>,
+    batches: Vec<Vec<ZipItem>>,
+    file_options: SimpleFileOptions,
+    worker_count: usize,
+) -> Result<()> {
+    let worker_count = worker_count.min(batches.len()).max(1);
+    let next_idx = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let pushed_gate = Mutex::new(0usize);
+    let pushed_cv = Condvar::new();
+    let (tx, rx) = mpsc::sync_channel::<(usize, Result<Cursor<Vec<u8>>>)>(worker_count);
+
+    let cancel = || {
+        failed.store(true, Ordering::Relaxed);
+        // Hold the lock so a waiting worker cannot miss the notification.
+        let _guard = pushed_gate.lock().unwrap();
+        pushed_cv.notify_all();
+    };
+
+    let result: Result<()> = std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            let batches = &batches;
+            let next_idx = &next_idx;
+            let failed = &failed;
+            let pushed_gate = &pushed_gate;
+            let pushed_cv = &pushed_cv;
+
+            scope.spawn(move || {
+                loop {
+                    if failed.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= batches.len() {
+                        return;
+                    }
+
+                    // Window: at most `worker_count` batches may be prepared
+                    // ahead of the batch the merger needs next.
+                    {
+                        let mut pushed = pushed_gate.lock().unwrap();
+                        while idx >= *pushed + worker_count {
+                            if failed.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            pushed = pushed_cv.wait(pushed).unwrap();
+                        }
+                    }
+
+                    let batch = &batches[idx];
+                    let res: Result<Cursor<Vec<u8>>> = (|| {
+                        // Do not reserve the whole uncompressed size up front:
+                        // compressible data needs far less, and the Vec will
+                        // grow as needed.
+                        let initial_capacity = (batch_bytes(batch) as usize).min(4 * 1024 * 1024);
+                        let cursor = Cursor::new(Vec::with_capacity(initial_capacity));
+                        let mut sub_writer = ZipWriter::new(cursor);
+                        for item in batch {
+                            sub_writer.start_file(item.name.clone(), file_options)?;
+                            let f = File::open(&item.path)?;
+                            let mut buf_f = BufReader::with_capacity(64 * 1024, f);
+                            copy(&mut buf_f, &mut sub_writer)?;
+                        }
+                        Ok(sub_writer.finish()?)
+                    })();
+
+                    if tx.send((idx, res)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+
+        drop(tx);
+
+        let mut pending: BTreeMap<usize, Cursor<Vec<u8>>> = BTreeMap::new();
+        let mut pushed = 0usize;
+
+        while pushed < batches.len() {
+            match rx.recv() {
+                Ok((idx, Ok(cursor))) => {
+                    pending.insert(idx, cursor);
+                }
+                Ok((_idx, Err(e))) => {
+                    cancel();
+                    return Err(e);
+                }
+                Err(_) => {
+                    cancel();
+                    anyhow::bail!(
+                        "Parallel ZIP compression stopped after {} of {} batches",
+                        pushed,
+                        batches.len()
+                    );
+                }
+            }
+
+            while let Some(cursor) = pending.remove(&pushed) {
+                let merged: Result<()> = (|| {
+                    let sub_archive = ZipArchive::new(cursor)?;
+                    writer.merge_archive(sub_archive)?;
+                    Ok(())
+                })();
+                if let Err(e) = merged {
+                    cancel();
+                    return Err(e);
+                }
+
+                pushed += 1;
+                {
+                    let mut gate = pushed_gate.lock().unwrap();
+                    *gate = pushed;
+                }
+                pushed_cv.notify_all();
+            }
+        }
+
+        Ok(())
+    });
+
+    result
+}
+
 impl ArchiveWriter for ZipHandler {
     fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
         let file = File::create(archive_path)
@@ -228,10 +434,11 @@ impl ArchiveWriter for ZipHandler {
             .compression_method(method)
             .compression_level(comp_level);
 
-        let dir_options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let dir_options =
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
 
         let mut dir_entries: Vec<String> = Vec::new();
-        let mut file_items: Vec<(PathBuf, String)> = Vec::new();
+        let mut file_items: Vec<ZipItem> = Vec::new();
 
         for target in files {
             if target.is_dir() {
@@ -243,15 +450,31 @@ impl ArchiveWriter for ZipHandler {
                     let rel_name = rel_path.to_string_lossy().replace('\\', "/");
 
                     if path.is_dir() {
-                        let dir_name = if rel_name.ends_with('/') { rel_name } else { format!("{}/", rel_name) };
+                        let dir_name = if rel_name.ends_with('/') {
+                            rel_name
+                        } else {
+                            format!("{}/", rel_name)
+                        };
                         dir_entries.push(dir_name);
                     } else if path.is_file() {
-                        file_items.push((path.to_path_buf(), rel_name));
+                        file_items.push(ZipItem {
+                            path: path.to_path_buf(),
+                            name: rel_name,
+                            size: entry.metadata()?.len(),
+                        });
                     }
                 }
             } else if target.is_file() {
-                let file_name = target.file_name().unwrap_or_default().to_string_lossy().to_string();
-                file_items.push((target.clone(), file_name));
+                let file_name = target
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                file_items.push(ZipItem {
+                    path: target.clone(),
+                    name: file_name,
+                    size: target.metadata()?.len(),
+                });
             }
         }
 
@@ -265,97 +488,88 @@ impl ArchiveWriter for ZipHandler {
             return Ok(());
         }
 
-        let num_threads = options.threads.unwrap_or_else(|| {
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-        }).max(1);
+        let num_threads = options
+            .threads
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            })
+            .max(1);
 
-        if num_threads <= 1 || file_items.len() <= 1 {
-            // Sequential compression path
-            for (path, rel_name) in file_items {
-                writer.start_file(rel_name, file_options)?;
-                let f = File::open(&path)?;
+        let total_size = file_items
+            .iter()
+            .fold(0u64, |acc, item| acc.saturating_add(item.size));
+        let max_batch_bytes = zip_batch_limit(num_threads);
+        let has_oversized_file = file_items.iter().any(|item| item.size > max_batch_bytes);
+        let use_parallel = num_threads > 1
+            && file_items.len() > 1
+            && !has_oversized_file
+            && total_size > max_batch_bytes;
+
+        if !use_parallel {
+            // Sequential streaming path. This also handles archives whose
+            // files are too large to buffer as a batch, so memory stays
+            // bounded regardless of input size.
+            for item in file_items {
+                writer.start_file(item.name, file_options)?;
+                let f = File::open(&item.path)?;
                 let mut buf_f = BufReader::with_capacity(64 * 1024, f);
                 copy(&mut buf_f, &mut writer)?;
             }
         } else {
-            // Parallel bounded producer-consumer pipeline
-            let batch_size = (file_items.len() / (num_threads * 4)).clamp(1, 32);
-            let batches: Vec<Vec<(PathBuf, String)>> = file_items
-                .chunks(batch_size)
-                .map(|c| c.to_vec())
-                .collect();
-            let total_batches = batches.len();
-
-            let bound = (num_threads * 2).max(4);
-            let (tx, rx) = mpsc::sync_channel::<Result<(usize, Cursor<Vec<u8>>)>>(bound);
-
-            let next_batch_idx = AtomicUsize::new(0);
-            let worker_count = num_threads.min(total_batches);
-
-            std::thread::scope(|s| {
-                for _ in 0..worker_count {
-                    let tx = tx.clone();
-                    let next_batch_idx = &next_batch_idx;
-                    let batches = &batches;
-                    s.spawn(move || {
-                        loop {
-                            let idx = next_batch_idx.fetch_add(1, Ordering::Relaxed);
-                            if idx >= batches.len() {
-                                break;
-                            }
-                            let batch = &batches[idx];
-                            let res: Result<Cursor<Vec<u8>>> = (|| {
-                                let cursor = Cursor::new(Vec::new());
-                                let mut sub_writer = ZipWriter::new(cursor);
-                                for (path, rel_name) in batch {
-                                    sub_writer.start_file(rel_name, file_options)?;
-                                    let f = File::open(path)?;
-                                    let mut buf_f = BufReader::with_capacity(64 * 1024, f);
-                                    copy(&mut buf_f, &mut sub_writer)?;
-                                }
-                                let finished = sub_writer.finish()?;
-                                Ok(finished)
-                            })();
-
-                            match res {
-                                Ok(cursor) => {
-                                    if tx.send(Ok((idx, cursor))).is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(e));
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                }
-
-                drop(tx);
-
-                let mut expected_idx = 0;
-                let mut pending: BTreeMap<usize, Cursor<Vec<u8>>> = BTreeMap::new();
-
-                while let Ok(msg) = rx.recv() {
-                    let (idx, cursor) = msg?;
-                    pending.insert(idx, cursor);
-                    while let Some(cursor) = pending.remove(&expected_idx) {
-                        let sub_archive = ZipArchive::new(cursor)?;
-                        writer.merge_archive(sub_archive)?;
-                        expected_idx += 1;
-                    }
-                }
-
-                if expected_idx != total_batches {
-                    anyhow::bail!("Parallel compression failed: processed {} of {} batches", expected_idx, total_batches);
-                }
-
-                Ok(())
-            })?;
+            // Parallel bounded producer-consumer pipeline.
+            let batches = build_batches(file_items, max_batch_bytes);
+            let max_workers_by_memory = (MAX_INFLIGHT_BYTES / max_batch_bytes).max(1) as usize;
+            let worker_count = num_threads
+                .min(batches.len())
+                .min(max_workers_by_memory)
+                .max(1);
+            push_parallel_batches(&mut writer, batches, file_options, worker_count)?;
         }
 
         writer.finish()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(size: u64) -> ZipItem {
+        ZipItem {
+            path: PathBuf::new(),
+            name: String::new(),
+            size,
+        }
+    }
+
+    #[test]
+    fn batches_respect_byte_budget() {
+        let batches = build_batches(vec![item(4), item(4), item(4), item(4), item(4)], 10);
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| batch_bytes(batch) <= 10));
+    }
+
+    #[test]
+    fn oversized_item_gets_its_own_batch() {
+        let batches = build_batches(vec![item(5), item(20), item(5)], 10);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batch_bytes(&batches[1]), 20);
+    }
+
+    #[test]
+    fn batches_respect_file_count() {
+        let batches = build_batches(vec![item(1); MAX_BATCH_FILES + 5], u64::MAX);
+        assert_eq!(batches.len(), 2);
+        assert!(batches.iter().all(|batch| batch.len() <= MAX_BATCH_FILES));
+    }
+
+    #[test]
+    fn zero_sized_files_are_batched() {
+        let batches = build_batches(vec![item(0); 10], 1024);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 10);
     }
 }
