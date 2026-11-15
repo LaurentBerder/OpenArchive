@@ -22,6 +22,11 @@ const MB: u64 = 1024 * 1024;
 /// file cannot force its entire compressed image into RAM.
 const MAX_PREPARED_BLOCK: u64 = 256 * MB;
 
+/// Budget for prepared blocks held across all workers. Block size and worker
+/// count are both derived from this so a large archive cannot multiply the
+/// per-block cap by the thread count.
+const MAX_INFLIGHT_BYTES: u64 = 256 * MB;
+
 /// Target maximum size of one solid block when compressing in parallel.
 /// Smaller blocks improve load balancing and bound peak memory; larger blocks
 /// improve the compression ratio.
@@ -38,6 +43,53 @@ const MT_BLOCK_THRESHOLD: u64 = 8 * MB;
 /// Uncompressed chunk size for multi-threaded LZMA2. Must be at least the
 /// dictionary size; `Lzma2Options` clamps it.
 const MT_CHUNK_SIZE: u64 = 32 * MB;
+
+/// Maximum bytes buffered by the 7z extraction queue. Limits the producer
+/// ahead of the writer pool regardless of thread count or item size.
+const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+
+struct ByteBudget {
+    capacity: usize,
+    used: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl ByteBudget {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            used: Mutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Reserve `bytes` from the budget, waiting while the budget is full.
+    /// Returns false if the first worker error was recorded in the meantime.
+    fn reserve(&self, bytes: usize, first_err: &Mutex<Option<anyhow::Error>>) -> bool {
+        let mut used = self.used.lock().unwrap();
+        while (*used).saturating_add(bytes) > self.capacity && *used > 0 {
+            if first_err.lock().unwrap().is_some() {
+                return false;
+            }
+            used = self.cv.wait(used).unwrap();
+        }
+        *used = (*used).saturating_add(bytes);
+        true
+    }
+
+    fn release(&self, bytes: usize) {
+        {
+            let mut used = self.used.lock().unwrap();
+            *used = used.saturating_sub(bytes);
+        }
+        self.cv.notify_all();
+    }
+
+    fn wake_all(&self) {
+        let _guard = self.used.lock().unwrap();
+        self.cv.notify_all();
+    }
+}
 
 struct LazyFileReader {
     path: PathBuf,
@@ -196,14 +248,16 @@ impl ArchiveReader for SevenZHandler {
             // Decompressor streams small/medium files into a bounded queue;
             // a worker pool writes them in parallel, decoupling disk I/O from LZMA2 decoding.
             let bound = (num_threads * 4).max(8);
-            let (tx, rx) = mpsc::sync_channel::<(PathBuf, Vec<u8>)>(bound);
+            let (tx, rx) = mpsc::sync_channel::<(PathBuf, Vec<u8>, usize)>(bound);
             let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
             let rx = Arc::new(Mutex::new(rx));
+            let budget = Arc::new(ByteBudget::new(MAX_QUEUED_BYTES));
 
             std::thread::scope(|s| {
                 for _ in 0..num_threads {
                     let rx = rx.clone();
                     let first_err = &first_err;
+                    let budget = budget.clone();
                     s.spawn(move || {
                         loop {
                             if first_err.lock().unwrap().is_some() {
@@ -213,7 +267,7 @@ impl ArchiveReader for SevenZHandler {
                                 let guard = rx.lock().unwrap();
                                 guard.recv().ok()
                             };
-                            let Some((target_path, data)) = task else {
+                            let Some((target_path, data, reserved)) = task else {
                                 break;
                             };
 
@@ -221,12 +275,17 @@ impl ArchiveReader for SevenZHandler {
                                 file_io::write_buffer(&target_path, &data).map_err(Into::into);
 
                             if let Err(e) = res {
-                                let mut g = first_err.lock().unwrap();
-                                if g.is_none() {
-                                    *g = Some(e);
+                                {
+                                    let mut g = first_err.lock().unwrap();
+                                    if g.is_none() {
+                                        *g = Some(e);
+                                    }
                                 }
+                                budget.release(reserved);
+                                budget.wake_all();
                                 break;
                             }
+                            budget.release(reserved);
                         }
                     });
                 }
@@ -253,10 +312,34 @@ impl ArchiveReader for SevenZHandler {
 
                         const MAX_ASYNC_SIZE: u64 = 8 * 1024 * 1024; // 8 MB threshold for in-memory pipeline
                         if entry.size() <= MAX_ASYNC_SIZE {
-                            let mut data = Vec::with_capacity(entry.size() as usize);
-                            stream.read_to_end(&mut data)?;
-                            if tx.send((target_path, data)).is_err() {
+                            let reserved = entry.size() as usize;
+                            if !budget.reserve(reserved, &first_err) {
                                 return Ok(false);
+                            }
+
+                            let mut data = Vec::with_capacity(reserved);
+                            if let Err(e) = stream.read_to_end(&mut data) {
+                                budget.release(reserved);
+                                return Err(e.into());
+                            }
+
+                            let mut item = (target_path, data, reserved);
+                            loop {
+                                if first_err.lock().unwrap().is_some() {
+                                    budget.release(item.2);
+                                    return Ok(false);
+                                }
+                                match tx.try_send(item) {
+                                    Ok(()) => break,
+                                    Err(mpsc::TrySendError::Full(returned)) => {
+                                        item = returned;
+                                        std::thread::yield_now();
+                                    }
+                                    Err(mpsc::TrySendError::Disconnected(returned)) => {
+                                        budget.release(returned.2);
+                                        return Ok(false);
+                                    }
+                                }
                             }
                         } else {
                             // Large files streamed directly; small ones were
@@ -306,6 +389,7 @@ impl ArchiveReader for SevenZHandler {
 }
 
 /// One file queued for compression, with its already-built 7z entry.
+#[derive(Clone)]
 struct FileItem {
     entry: SzEntry,
     path: PathBuf,
@@ -317,12 +401,14 @@ type Block = Vec<FileItem>;
 /// Size limit for one solid block.
 ///
 /// A single-thread run uses one large block (best ratio). A parallel run aims
-/// for roughly one block per thread, clamped so blocks stay small enough to
-/// prepare in memory and large enough for LZMA2 to find long-range matches.
+/// for roughly one block per thread, clamped so the sum of in-flight blocks
+/// stays within `MAX_INFLIGHT_BYTES`.
 fn block_size(num_threads: usize, total_size: u64) -> u64 {
     if num_threads <= 1 {
         return u64::MAX;
     }
+
+    let per_worker_cap = (MAX_INFLIGHT_BYTES / num_threads as u64).max(1);
 
     // Escape hatch used by the integration tests to exercise the multi-block
     // path on small fixtures.
@@ -330,16 +416,33 @@ fn block_size(num_threads: usize, total_size: u64) -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
-        return limit.max(1);
+        return limit.max(1).min(per_worker_cap);
     }
 
-    (total_size / num_threads as u64).clamp(MIN_PARALLEL_BLOCK_SIZE, PARALLEL_BLOCK_SIZE)
+    let target =
+        (total_size / num_threads as u64).clamp(MIN_PARALLEL_BLOCK_SIZE, PARALLEL_BLOCK_SIZE);
+
+    target.min(per_worker_cap).max(1)
 }
 
 fn block_uncompressed_size(block: &Block) -> u64 {
     block
         .iter()
         .fold(0u64, |acc, item| acc.saturating_add(item.size))
+}
+
+/// Workers allowed to hold prepared blocks, constrained by the total in-flight
+/// budget and the largest block (which may be a single oversized file).
+fn prepared_worker_count(blocks: &[Block], num_threads: usize) -> usize {
+    let largest = blocks
+        .iter()
+        .map(block_uncompressed_size)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let by_memory = (MAX_INFLIGHT_BYTES / largest).max(1) as usize;
+
+    num_threads.min(blocks.len()).min(by_memory).max(1)
 }
 
 /// Group files into solid blocks. A file is never split across blocks, so an
@@ -642,12 +745,13 @@ impl ArchiveWriter for SevenZHandler {
         let has_oversized_block = blocks
             .iter()
             .any(|b| block_uncompressed_size(b) > MAX_PREPARED_BLOCK);
+        let prepared_workers = prepared_worker_count(&blocks, num_threads);
 
-        if num_threads > 1 && blocks.len() > 1 && !has_oversized_block {
+        if num_threads > 1 && blocks.len() > 1 && prepared_workers > 1 && !has_oversized_block {
             // Parallel solid blocks: every block is encoded on a worker and
             // appended in order by the writer thread.
             let methods = Arc::new(single_methods);
-            push_prepared_blocks(&mut writer, blocks, methods, num_threads)?;
+            push_prepared_blocks(&mut writer, blocks, methods, prepared_workers)?;
         } else {
             // Streaming path: one block (or many independent blocks in
             // non-solid mode). Large blocks use multi-threaded LZMA2 inside
@@ -706,5 +810,32 @@ mod tests {
         assert_eq!(methods.len(), 2);
         assert_eq!(methods[0].method, EncoderMethod::AES256_SHA256);
         assert_eq!(methods[1].method, EncoderMethod::COPY);
+    }
+
+    fn block_of_size(size: u64) -> Block {
+        vec![FileItem {
+            entry: SzEntry::default(),
+            path: PathBuf::new(),
+            size,
+        }]
+    }
+
+    #[test]
+    fn prepared_workers_respect_inflight_budget() {
+        let small_blocks = vec![block_of_size(8 * MB); 12];
+        assert_eq!(prepared_worker_count(&small_blocks, 12), 12);
+
+        let large_blocks = vec![block_of_size(64 * MB); 12];
+        assert_eq!(prepared_worker_count(&large_blocks, 12), 4);
+    }
+
+    #[test]
+    fn byte_budget_tracks_reservations() {
+        let budget = ByteBudget::new(10);
+        let error = Mutex::new(None);
+        assert!(budget.reserve(6, &error));
+        assert!(budget.reserve(4, &error));
+        budget.release(6);
+        assert!(budget.reserve(6, &error));
     }
 }

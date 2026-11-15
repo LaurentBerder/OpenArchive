@@ -1,5 +1,6 @@
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 /// Buffer size for large sequential reads and writes. Large enough to keep
@@ -19,6 +20,37 @@ pub(crate) const SMALL_READ_BUFFER: usize = 8 * 1024;
 
 #[cfg(windows)]
 const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+
+thread_local! {
+    /// One large copy buffer per thread, reused across files. This avoids a
+    /// fresh `BufReader`/`BufWriter` allocation for every archive entry.
+    static COPY_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0u8; IO_BUFFER_SIZE]);
+}
+
+/// Copy a stream of known size, using the thread-local buffer for large
+/// entries and `std::io::copy`'s stack buffer for small ones.
+fn copy_stream<R: Read + ?Sized, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+    size: u64,
+) -> io::Result<()> {
+    if size < SMALL_FILE_THRESHOLD {
+        io::copy(reader, writer)?;
+        return Ok(());
+    }
+
+    COPY_BUFFER.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        loop {
+            let read = reader.read(&mut buffer[..])?;
+            if read == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..read])?;
+        }
+        Ok(())
+    })
+}
 
 /// Open a file for sequential reading. On Windows this sets
 /// `FILE_FLAG_SEQUENTIAL_SCAN`, letting the cache manager tune read-ahead for
@@ -46,38 +78,19 @@ pub(crate) fn read_buffer_capacity(size: u64) -> usize {
 
 /// Copy a file into a writer, choosing the buffer from its size.
 pub(crate) fn copy_file_to<W: Write>(path: &Path, size: u64, writer: &mut W) -> io::Result<()> {
-    let file = open_sequential(path)?;
-
-    if size < SMALL_FILE_THRESHOLD {
-        let mut input = file;
-        io::copy(&mut input, writer)?;
-    } else {
-        let mut input = BufReader::with_capacity(IO_BUFFER_SIZE, file);
-        io::copy(&mut input, writer)?;
-    }
-
-    Ok(())
+    let mut file = open_sequential(path)?;
+    copy_stream(&mut file, writer, size)
 }
 
 /// Write a decompressed entry to disk. Small entries are written directly;
-/// large ones go through a buffered writer.
+/// large ones reuse the thread-local copy buffer.
 pub(crate) fn copy_to_file<R: Read + ?Sized>(
     reader: &mut R,
     path: &Path,
     size: u64,
 ) -> io::Result<()> {
-    let file = File::create(path)?;
-
-    if size < SMALL_FILE_THRESHOLD {
-        let mut output = file;
-        io::copy(reader, &mut output)?;
-    } else {
-        let mut output = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
-        io::copy(reader, &mut output)?;
-        output.flush()?;
-    }
-
-    Ok(())
+    let mut file = File::create(path)?;
+    copy_stream(reader, &mut file, size)
 }
 
 /// Write an entry that is already fully decoded in memory. Avoids a

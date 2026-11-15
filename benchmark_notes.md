@@ -407,7 +407,7 @@ No numerical performance advantage should be claimed until the benchmark has bee
 
 ### Priority 2: Parallel processing [COMPLETED]
 
-- [x] **Parallel LZMA2 compression (7z):** Replaced `sevenz-rust` 0.6 with `sevenz-rust2` 0.25. Files are grouped into solid blocks targeting 64 MB; a file that does not fit forms a block of its own. Each block is encoded on a scoped worker thread with `prepare_block` and appended in archive order with `push_prepared_block`. A sliding window limits workers to `N` blocks ahead of the writer, and prepared blocks are capped at 256 MB, so in-flight memory is bounded by the worker count rather than the archive size. `-mmt={N|on|off}` selects the worker count; `-mmt=1` keeps a single solid block. Blocks larger than 256 MB (for example one huge file) take the streaming path with multi-threaded LZMA2 inside their own stream, so they are never buffered whole in memory.
+- [x] **Parallel LZMA2 compression (7z):** Replaced `sevenz-rust` 0.6 with `sevenz-rust2` 0.25. Files are grouped into solid blocks targeting 64 MB; a file that does not fit forms a block of its own. Block size and worker count are derived from a 256 MB in-flight budget, then each block is encoded on a scoped worker thread with `prepare_block` and appended in archive order with `push_prepared_block`. A sliding window limits workers to `N` blocks ahead of the writer. `-mmt={N|on|off}` selects the worker count; `-mmt=1` keeps a single solid block. Blocks larger than 256 MB (for example one huge file) take the streaming path with multi-threaded LZMA2 inside their own stream, so they are never buffered whole in memory.
   - **Preliminary validation** (Ryzen 5 7600, 6C/12T, 31.1 GB RAM, NTFS SSD, 7-Zip 26.06): 128 MB random dataset (32 × 4 MB), `-mx=5`, compression time fell from 45.77 s at `-mmt=1` to 7.98 s at `-mmt=8` (5.7×) and 7.55 s at `-mmt=12` (6.1×). On a 128 MB highly compressible text dataset, 4.34 s → 1.01 s (4.3×) with the same archive size. For reference, 7-Zip took 2.76 s → 0.66 s on the text dataset, so OpenArchive reaches about 65% of 7-Zip's throughput at both 1 and 8 threads with similar scaling.
   - **Interoperability:** every generated archive passed `7z t`; 7-Zip extraction hashes matched the source in both directions (OpenArchive → 7-Zip and 7-Zip → OpenArchive); multi-block encrypted archives also round-tripped correctly.
 - [x] **Introduce bounded producer/consumer pipelines:** Built bounded producer/consumer channels (`mpsc::sync_channel`) for compression and extraction. ZIP compression batches files by uncompressed size (`min(32 MB, 256 MB / threads)`, at most 256 entries per batch), and a sliding window stops workers from racing more than `worker_count` batches ahead of the merger, so the reorder buffer cannot grow with archive size. In-flight uncompressed batch data is capped at 256 MB; files larger than the batch limit fall back to the streaming sequential writer, so they are never prepared in memory. The 7z extraction pipeline decouples LZMA2 stream decoding from concurrent file writes up to an 8 MB threshold per item.
@@ -424,13 +424,18 @@ No numerical performance advantage should be claimed until the benchmark has bee
 - [x] **Optimize handling of small files:** Decompressed entries below 64 KB are written directly instead of allocating a 64 KB `BufWriter` per file; 7z parallel workers write fully decoded buffers directly; compression readers no longer allocate a 64 KB buffer for every tiny file. This removes per-file buffer allocation and an extra copy on the small-file path.
   - **Note:** extraction wall time on a 1,000-file subset was effectively unchanged (31.66 s → 32.86 s) because Windows Defender scans each newly created file, which dominates the measurement. The allocation/copy reductions are real but not visible under that AV overhead.
 
-### Priority 4: Memory management
+### Priority 4: Memory management [COMPLETED]
 
-- Measure allocation frequency.
-- Reuse buffers.
-- Reduce intermediate allocations.
-- Measure peak memory consumption.
-- Evaluate memory usage under multithreaded workloads.
+- [x] **Measure allocation frequency:** Added an ignored profiling harness (`tests/alloc_profile.rs`) that installs a counting global allocator and reports allocation count and peak live bytes. Run it with `cargo test --release --test alloc_profile -- --ignored --nocapture --test-threads=1`.
+  - Before → after buffer reuse, 200 × 128 KiB ZIP: creation 4,042 → 3,843 allocations; extraction at 1 thread 3,230 → 3,034 and at 8 threads 9,747 → 9,551. The saved allocations are the per-file 256 KiB `BufReader`/`BufWriter` buffers.
+  - Small-file (400 × 4 KiB) extraction stayed around 3,900 allocations; those paths already wrote directly after Priority 3.
+- [x] **Reuse buffers:** Replaced per-file buffered readers/writers with one 256 KiB thread-local copy buffer, reused across entries on the same worker. Small entries continue to use the stack-buffered copy path, which allocates nothing on the heap.
+- [x] **Reduce intermediate allocations:** Size-aware read/write paths avoid allocating a large buffer for a tiny file; direct writes handle small extracted entries; archive writers use a single 1 MiB output buffer. The allocation harness is the regression check for further changes.
+- [x] **Measure peak memory consumption:** On a 128 MB random 7z fixture (`-mx=5`): 103 MB at `-mmt=1`, 898 MB at `-mmt=8`, and 1,062 MB at `-mmt=12`. At `-mx=9` and `-mmt=8` it reached 1,831 MB. LZMA2 encoder structures (dictionary and match finder) dominate 7z compression; prepared-block buffering is a smaller part. ZIP compression measured 9.7 MB at `-mmt=1`, ~341 MB at `-mmt=8`, and 265 MB at `-mmt=12` on 256 MB of data.
+- [x] **Evaluate memory usage under multithreaded workloads:** Added two explicit budgets:
+  - 7z prepared blocks: block size is capped by `min(64 MB, 256 MB / threads)` and worker count is capped by the largest block, so prepared output stays near the 256 MB budget rather than multiplying a 64 MB block by every thread.
+  - 7z extraction queue: a 64 MB byte budget replaces the previous item-count-only bound. On 32 × 4 MB entries, peak working set fell from 163 MB to 111 MB at `-mmt=8` and from 162 MB to 110 MB at `-mmt=12`; `-mmt=1` stayed at ~51 MB.
+  - **Remaining caveat:** codec-internal memory is not budgeted. LZMA2 encoder memory scales with worker count and `-md` / compression level, so high thread counts at high levels can still use gigabytes. The measured figures above quantify that boundary; users can reduce `-mmt`, `-md`, or the level for lower memory.
 
 Every optimization must be validated against the benchmark suite.
 
@@ -497,7 +502,7 @@ The following tables should be populated with actual measurements.
 
 The source-code investigation suggests that 7-Zip still has advantages in compression-engine maturity and Windows-specific optimization. OpenArchive now exposes the main compression settings and compresses 7z solid blocks in parallel.
 
-The remaining implementation priority is memory management (Priority 4). The full benchmark matrix remains to be run.
+All implementation priorities are complete. The full benchmark matrix remains to be run.
 
 These findings do not establish actual performance ratios.
 
