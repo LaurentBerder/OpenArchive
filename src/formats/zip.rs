@@ -117,13 +117,17 @@ impl ArchiveWriter for ZipHandler {
             .with_context(|| format!("Failed to create zip file: {}", archive_path.display()))?;
         let mut writer = ZipWriter::new(file);
 
-        let method = if options.level == 0 {
-            CompressionMethod::Stored
+        let (method, comp_level) = if options.level == 0 {
+            (CompressionMethod::Stored, None)
         } else {
-            CompressionMethod::Deflated
+            (CompressionMethod::Deflated, Some(options.level as i64))
         };
 
-        let file_options = SimpleFileOptions::default().compression_method(method);
+        let file_options = SimpleFileOptions::default()
+            .compression_method(method)
+            .compression_level(comp_level);
+
+        let dir_options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
 
         for target in files {
             if target.is_dir() {
@@ -136,7 +140,7 @@ impl ArchiveWriter for ZipHandler {
 
                     if path.is_dir() {
                         let dir_name = if rel_name.ends_with('/') { rel_name } else { format!("{}/", rel_name) };
-                        writer.add_directory(dir_name, file_options)?;
+                        writer.add_directory(dir_name, dir_options)?;
                     } else if path.is_file() {
                         writer.start_file(rel_name, file_options)?;
                         let mut f = File::open(path)?;

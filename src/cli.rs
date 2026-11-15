@@ -20,8 +20,36 @@ pub struct CliArgs {
     pub output_dir: PathBuf,
     pub password: Option<String>,
     pub compression_level: u8,
+    pub solid: bool,
+    pub dict_size: Option<u32>,
+    pub threads: Option<usize>,
     pub recurse: bool,
     pub assume_yes: bool,
+}
+
+pub fn parse_dict_size(val: &str) -> Option<u32> {
+    let s = val.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(num) = s.strip_suffix("gb").or_else(|| s.strip_suffix('g')) {
+        num.trim().parse::<u32>().ok().and_then(|n| n.checked_mul(1024 * 1024 * 1024))
+    } else if let Some(num) = s.strip_suffix("mb").or_else(|| s.strip_suffix('m')) {
+        num.trim().parse::<u32>().ok().and_then(|n| n.checked_mul(1024 * 1024))
+    } else if let Some(num) = s.strip_suffix("kb").or_else(|| s.strip_suffix('k')) {
+        num.trim().parse::<u32>().ok().and_then(|n| n.checked_mul(1024))
+    } else if let Some(num) = s.strip_suffix('b') {
+        num.trim().parse::<u32>().ok()
+    } else if let Ok(n) = s.parse::<u32>() {
+        if n <= 32 {
+            // 7-Zip convention: bits (2^n)
+            1u32.checked_shl(n)
+        } else {
+            Some(n)
+        }
+    } else {
+        None
+    }
 }
 
 impl CliArgs {
@@ -39,6 +67,9 @@ impl CliArgs {
                 output_dir: PathBuf::from("."),
                 password: None,
                 compression_level: 5,
+                solid: true,
+                dict_size: None,
+                threads: None,
                 recurse: false,
                 assume_yes: false,
             });
@@ -49,6 +80,9 @@ impl CliArgs {
         let mut output_dir = PathBuf::from(".");
         let mut password = None;
         let mut compression_level = 5;
+        let mut solid = true;
+        let mut dict_size = None;
+        let mut threads = None;
         let mut recurse = false;
         let mut assume_yes = false;
 
@@ -78,9 +112,67 @@ impl CliArgs {
                     password = Some(raw[i].clone());
                 }
             } else if arg.starts_with("-mx") {
-                let val = arg[3..].trim_start_matches('=').to_string();
-                if let Ok(lvl) = val.parse::<u8>() {
-                    compression_level = lvl.clamp(0, 9);
+                let val = arg[3..].trim_start_matches('=').trim().to_string();
+                if !val.is_empty() {
+                    if let Ok(lvl) = val.parse::<u8>() {
+                        compression_level = lvl.clamp(0, 9);
+                    }
+                } else if i + 1 < raw.len() {
+                    if let Ok(lvl) = raw[i + 1].trim().parse::<u8>() {
+                        i += 1;
+                        compression_level = lvl.clamp(0, 9);
+                    }
+                }
+            } else if arg.starts_with("-md") {
+                let val = arg[3..].trim_start_matches('=').trim().to_string();
+                if !val.is_empty() {
+                    dict_size = parse_dict_size(&val);
+                } else if i + 1 < raw.len() {
+                    i += 1;
+                    dict_size = parse_dict_size(&raw[i]);
+                }
+            } else if arg.starts_with("-ms") {
+                let val = arg[3..].trim_start_matches('=').trim().to_lowercase();
+                if val.is_empty() || val == "on" || val == "+" || val == "yes" {
+                    solid = true;
+                } else if val == "off" || val == "-" || val == "no" || val == "e" {
+                    solid = false;
+                } else if i + 1 < raw.len() {
+                    let next_val = raw[i + 1].trim_start_matches('=').trim().to_lowercase();
+                    if next_val == "on" || next_val == "+" || next_val == "yes" {
+                        i += 1;
+                        solid = true;
+                    } else if next_val == "off" || next_val == "-" || next_val == "no" || next_val == "e" {
+                        i += 1;
+                        solid = false;
+                    }
+                }
+            } else if arg.starts_with("-mmt") {
+                let val = arg[4..].trim_start_matches('=').trim().to_lowercase();
+                if val.is_empty() || val == "on" || val == "+" || val == "yes" {
+                    let count = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1);
+                    threads = Some(count);
+                } else if val == "off" || val == "-" || val == "no" {
+                    threads = Some(1);
+                } else if let Ok(n) = val.parse::<usize>() {
+                    threads = Some(n.max(1));
+                } else if i + 1 < raw.len() {
+                    let next_val = raw[i + 1].trim_start_matches('=').trim().to_lowercase();
+                    if next_val == "on" || next_val == "+" || next_val == "yes" {
+                        i += 1;
+                        let count = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1);
+                        threads = Some(count);
+                    } else if next_val == "off" || next_val == "-" || next_val == "no" {
+                        i += 1;
+                        threads = Some(1);
+                    } else if let Ok(n) = next_val.parse::<usize>() {
+                        i += 1;
+                        threads = Some(n.max(1));
+                    }
                 }
             } else if arg == "-r" || arg == "-r-" {
                 recurse = arg == "-r";
@@ -122,6 +214,9 @@ impl CliArgs {
                 output_dir,
                 password,
                 compression_level,
+                solid,
+                dict_size,
+                threads,
                 recurse,
                 assume_yes,
             });
@@ -141,6 +236,9 @@ impl CliArgs {
             output_dir,
             password,
             compression_level,
+            solid,
+            dict_size,
+            threads,
             recurse,
             assume_yes,
         })
@@ -154,8 +252,76 @@ impl CliArgs {
             output_dir: PathBuf::from("."),
             password: None,
             compression_level: 5,
+            solid: true,
+            dict_size: None,
+            threads: None,
             recurse: false,
             assume_yes: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_dict_size() {
+        assert_eq!(parse_dict_size("512k"), Some(512 * 1024));
+        assert_eq!(parse_dict_size("16m"), Some(16 * 1024 * 1024));
+        assert_eq!(parse_dict_size("64MB"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_dict_size("1g"), Some(1024 * 1024 * 1024));
+        // 7-Zip bit exponents (<= 32)
+        assert_eq!(parse_dict_size("24"), Some(1 << 24)); // 16 MB
+        assert_eq!(parse_dict_size("26"), Some(1 << 26)); // 64 MB
+        // Raw bytes (> 32)
+        assert_eq!(parse_dict_size("1048576"), Some(1048576));
+    }
+
+    #[test]
+    fn test_parse_compression_switches() {
+        let args = CliArgs::parse_from([
+            "openarchive",
+            "a",
+            "test.7z",
+            "file.txt",
+            "-mx=9",
+            "-md=32m",
+            "-ms=off",
+            "-mmt=4",
+        ])
+        .unwrap();
+
+        assert_eq!(args.compression_level, 9);
+        assert_eq!(args.dict_size, Some(32 * 1024 * 1024));
+        assert_eq!(args.solid, false);
+        assert_eq!(args.threads, Some(4));
+    }
+
+    #[test]
+    fn test_parse_solid_variations() {
+        let args_on = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms=on"]).unwrap();
+        assert!(args_on.solid);
+
+        let args_off = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms=off"]).unwrap();
+        assert!(!args_off.solid);
+
+        let args_e = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms=e"]).unwrap();
+        assert!(!args_e.solid);
+
+        let args_minus = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms-"]).unwrap();
+        assert!(!args_minus.solid);
+    }
+
+    #[test]
+    fn test_parse_threads_variations() {
+        let args_1 = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-mmt=1"]).unwrap();
+        assert_eq!(args_1.threads, Some(1));
+
+        let args_off = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-mmt=off"]).unwrap();
+        assert_eq!(args_off.threads, Some(1));
+
+        let args_on = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-mmt=on"]).unwrap();
+        assert!(args_on.threads.unwrap() >= 1);
     }
 }

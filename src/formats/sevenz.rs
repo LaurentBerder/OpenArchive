@@ -1,11 +1,47 @@
 use std::fs::{self, File};
-use std::io::{self, copy};
+use std::io::{self, copy, Read};
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
-use sevenz_rust::{Password, SevenZArchiveEntry, SevenZReader, SevenZWriter};
+use sevenz_rust::{
+    lzma::LZMA2Options, AesEncoderOptions, MethodOptions, Password, SeqReader, SevenZArchiveEntry,
+    SevenZMethod, SevenZMethodConfiguration, SevenZReader, SevenZWriter, SourceReader,
+};
 use walkdir::WalkDir;
 
 use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
+
+struct LazyFileReader {
+    path: PathBuf,
+    file: Option<File>,
+    end: bool,
+}
+
+impl LazyFileReader {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            file: None,
+            end: false,
+        }
+    }
+}
+
+impl Read for LazyFileReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.end {
+            return Ok(0);
+        }
+        if self.file.is_none() {
+            self.file = Some(File::open(&self.path)?);
+        }
+        let n = self.file.as_mut().unwrap().read(buf)?;
+        if n == 0 {
+            self.end = true;
+            self.file = None; // Release OS file handle immediately
+        }
+        Ok(n)
+    }
+}
 
 pub struct SevenZHandler {
     path: PathBuf,
@@ -110,9 +146,32 @@ impl ArchiveReader for SevenZHandler {
 }
 
 impl ArchiveWriter for SevenZHandler {
-    fn create(archive_path: &Path, files: &[PathBuf], _options: &CompressionOptions) -> Result<()> {
+    fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
+        let mut lzma_opts = LZMA2Options::with_preset(options.level.clamp(0, 9) as u32);
+        if let Some(dict_size) = options.dict_size {
+            lzma_opts.dict_size = dict_size;
+        }
+
+        let mut content_methods: Vec<SevenZMethodConfiguration> = Vec::new();
+        if let Some(ref pwd) = options.password {
+            if !pwd.is_empty() {
+                content_methods.push(
+                    AesEncoderOptions::new(pwd.as_str().into()).into(),
+                );
+            }
+        }
+        content_methods.push(
+            SevenZMethodConfiguration::new(SevenZMethod::LZMA2)
+                .with_options(MethodOptions::LZMA2(lzma_opts)),
+        );
+
         let mut writer = SevenZWriter::create(archive_path)
             .with_context(|| format!("Failed to create 7z archive: {}", archive_path.display()))?;
+        writer.set_content_methods(content_methods);
+
+        // Separate directories and file items to support solid block compression
+        let mut dir_entries: Vec<SevenZArchiveEntry> = Vec::new();
+        let mut file_items: Vec<(SevenZArchiveEntry, PathBuf, u64)> = Vec::new();
 
         for target in files {
             if target.is_dir() {
@@ -123,19 +182,75 @@ impl ArchiveWriter for SevenZHandler {
                     let rel_path = path.strip_prefix(base).unwrap_or(path);
                     let rel_name = rel_path.to_string_lossy().replace('\\', "/");
 
-                    let archive_entry = SevenZArchiveEntry::from_path(path, rel_name);
-                    if path.is_file() {
-                        let file = File::open(path)?;
-                        writer.push_archive_entry(archive_entry, Some(file))?;
-                    } else if path.is_dir() {
-                        writer.push_archive_entry(archive_entry, None::<File>)?;
+                    if path.is_dir() {
+                        let archive_entry = SevenZArchiveEntry::from_path(path, rel_name);
+                        dir_entries.push(archive_entry);
+                    } else if path.is_file() {
+                        let size = entry.metadata()?.len();
+                        let archive_entry = SevenZArchiveEntry::from_path(path, rel_name);
+                        file_items.push((archive_entry, path.to_path_buf(), size));
                     }
                 }
             } else if target.is_file() {
                 let file_name = target.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let size = target.metadata()?.len();
                 let archive_entry = SevenZArchiveEntry::from_path(target, file_name);
-                let file = File::open(target)?;
-                writer.push_archive_entry(archive_entry, Some(file))?;
+                file_items.push((archive_entry, target.clone(), size));
+            }
+        }
+
+        // 1. Add all directory entries first
+        for dir_entry in dir_entries {
+            writer.push_archive_entry::<&[u8]>(dir_entry, None)?;
+        }
+
+        // 2. Add files: solid blocks vs non-solid blocks
+        if options.solid {
+            const MAX_BLOCK_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GB per solid block
+            let mut batch_entries = Vec::new();
+            let mut batch_readers = Vec::new();
+            let mut batch_size: u64 = 0;
+
+            for (entry, path, size) in file_items {
+                if size >= MAX_BLOCK_SIZE {
+                    if !batch_entries.is_empty() {
+                        writer.push_archive_entries(
+                            std::mem::take(&mut batch_entries),
+                            SeqReader::new(std::mem::take(&mut batch_readers)),
+                        )?;
+                        batch_size = 0;
+                    }
+                    writer.push_archive_entries(
+                        vec![entry],
+                        SeqReader::new(vec![SourceReader::from(LazyFileReader::new(path))]),
+                    )?;
+                    continue;
+                }
+
+                if batch_size + size >= MAX_BLOCK_SIZE && !batch_entries.is_empty() {
+                    writer.push_archive_entries(
+                        std::mem::take(&mut batch_entries),
+                        SeqReader::new(std::mem::take(&mut batch_readers)),
+                    )?;
+                    batch_size = 0;
+                }
+
+                batch_size += size;
+                batch_entries.push(entry);
+                batch_readers.push(SourceReader::from(LazyFileReader::new(path)));
+            }
+
+            if !batch_entries.is_empty() {
+                writer.push_archive_entries(
+                    batch_entries,
+                    SeqReader::new(batch_readers),
+                )?;
+            }
+        } else {
+            // Non-solid mode: each file is compressed in an individual block
+            for (entry, path, _size) in file_items {
+                let file = File::open(&path)?;
+                writer.push_archive_entry(entry, Some(file))?;
             }
         }
 

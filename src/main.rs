@@ -29,6 +29,9 @@ fn print_help() {
     println!("  -o{{dir}}      : Set Output directory");
     println!("  -p{{password}} : Set Password");
     println!("  -mx={{0..9}}   : Set compression level (0=Store, 1=Fastest, 5=Normal, 9=Ultra)");
+    println!("  -md={{size}}   : Set dictionary size (e.g. -md=64m, -md=16m, -md=24)");
+    println!("  -ms={{on|off}} : Enable/disable solid compression (-ms=on, -ms=off)");
+    println!("  -mmt={{N|on|off}}: Set CPU thread count (-mmt=on, -mmt=1, -mmt=4)");
     println!("  -r           : Recurse subdirectories");
     println!("  -y           : Assume Yes on all queries");
     println!();
@@ -72,8 +75,20 @@ fn main() -> Result<()> {
             let options = CompressionOptions {
                 level: args.compression_level,
                 password: args.password,
-                solid: true,
+                solid: args.solid,
+                dict_size: args.dict_size,
+                threads: args.threads,
             };
+
+            print!("Compression settings: level={}", options.level);
+            if let Some(ds) = options.dict_size {
+                print!(", dict_size={:.1}MB", ds as f64 / (1024.0 * 1024.0));
+            }
+            print!(", solid={}", if options.solid { "on" } else { "off" });
+            if let Some(th) = options.threads {
+                print!(", threads={}", th);
+            }
+            println!();
 
             create_archive(&args.archive, &args.files, &options)?;
 

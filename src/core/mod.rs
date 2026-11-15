@@ -81,12 +81,14 @@ pub struct ArchiveEntry {
     pub encrypted: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct CompressionOptions {
     pub level: u8, // 0 (Store) to 9 (Ultra)
     pub password: Option<String>,
     pub solid: bool,
+    pub dict_size: Option<u32>, // Dictionary size in bytes (e.g. 16MB = 16 * 1024 * 1024)
+    pub threads: Option<usize>, // Thread count (None = automatic / default)
 }
 
 impl Default for CompressionOptions {
@@ -95,6 +97,8 @@ impl Default for CompressionOptions {
             level: 5, // Normal
             password: None,
             solid: true,
+            dict_size: None,
+            threads: None,
         }
     }
 }
