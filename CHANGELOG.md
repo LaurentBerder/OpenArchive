@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+- 7z compression now encodes solid blocks concurrently across `-mmt` worker threads using `sevenz-rust2`'s `prepare_block` / `push_prepared_block`; blocks are appended in archive order from the writer thread.
+- A single oversized 7z block (for example one huge file) uses multi-threaded LZMA2 inside its own stream, with memory bounded by the chunk size.
+- Migrated the 7z backend from `sevenz-rust` 0.6 to `sevenz-rust2` 0.25.
+
+### Fixed
+- `-mmt` now changes 7z compression wall-clock time instead of only changing solid-block boundaries.
+
+---
+
 ## [0.1.0] — 2026-11-05
 
 ### Added
@@ -57,4 +69,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `wix/main.wxs` WiX source for the MSI installer
 - `.gitignore` excluding `target/` and `wix314-tools/`
 
+[Unreleased]: https://github.com/LaurentBerder/OpenArchive/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/LaurentBerder/OpenArchive/releases/tag/v0.1.0

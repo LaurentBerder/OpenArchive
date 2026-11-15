@@ -375,6 +375,7 @@ impl OpenArchiveGui {
                 flat: true,
                 password: None,
                 overwrite: true,
+                threads: None,
             };
             let filter = [full_internal.to_string()];
             if let Ok(()) = reader.extract(&opts, Some(&filter)) {
@@ -423,6 +424,7 @@ impl OpenArchiveGui {
                                     flat: !item.is_dir,
                                     password: None,
                                     overwrite: true,
+                                    threads: None,
                                 };
                                 let filter = [full_internal];
                                 if let Ok(()) = reader.extract(&opts, Some(&filter)) {
@@ -442,7 +444,7 @@ impl OpenArchiveGui {
             let arc = archive_path.clone();
             if let Some(dest) = rfd::FileDialog::new().pick_folder() {
                 if let Ok(mut reader) = get_reader(&arc, None) {
-                    let opts = ExtractOptions { output_dir: dest.clone(), flat: false, password: None, overwrite: true };
+                    let opts = ExtractOptions { output_dir: dest.clone(), flat: false, password: None, overwrite: true, threads: None };
                     if let Ok(()) = reader.extract(&opts, None) {
                         self.show_notification(format!("Extracted to {}", dest.display()));
                     }

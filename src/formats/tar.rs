@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{copy, sink, Read, Write};
+use std::io::{copy, sink, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bzip2::read::BzDecoder;
@@ -28,10 +29,11 @@ impl TarHandler {
     fn open_reader(&self) -> Result<Box<dyn Read>> {
         let file = File::open(&self.path)
             .with_context(|| format!("Failed to open archive: {}", self.path.display()))?;
+        let buf_file = BufReader::with_capacity(64 * 1024, file);
         match self.format {
-            ArchiveFormat::Tar => Ok(Box::new(file)),
-            ArchiveFormat::TarGz => Ok(Box::new(GzDecoder::new(file))),
-            ArchiveFormat::TarBz2 => Ok(Box::new(BzDecoder::new(file))),
+            ArchiveFormat::Tar => Ok(Box::new(buf_file)),
+            ArchiveFormat::TarGz => Ok(Box::new(GzDecoder::new(buf_file))),
+            ArchiveFormat::TarBz2 => Ok(Box::new(BzDecoder::new(buf_file))),
             _ => anyhow::bail!("Unsupported tar format variant"),
         }
     }
@@ -69,6 +71,9 @@ impl ArchiveReader for TarHandler {
 
         fs::create_dir_all(&options.output_dir)?;
 
+        let mut known_dirs: HashSet<PathBuf> = HashSet::new();
+        known_dirs.insert(options.output_dir.clone());
+
         for entry in archive.entries()? {
             let mut entry = entry?;
             let name = entry.path()?.to_string_lossy().to_string();
@@ -87,15 +92,19 @@ impl ArchiveReader for TarHandler {
             };
 
             if entry.header().entry_type().is_dir() {
-                if !options.flat {
+                if !options.flat && known_dirs.insert(target_path.clone()) {
                     fs::create_dir_all(&target_path)?;
                 }
             } else {
                 if let Some(parent) = target_path.parent() {
-                    fs::create_dir_all(parent)?;
+                    if known_dirs.insert(parent.to_path_buf()) {
+                        fs::create_dir_all(parent)?;
+                    }
                 }
-                let mut out = File::create(&target_path)?;
-                copy(&mut entry, &mut out)?;
+                let out = File::create(&target_path)?;
+                let mut buf_out = BufWriter::with_capacity(64 * 1024, out);
+                copy(&mut entry, &mut buf_out)?;
+                buf_out.flush()?;
             }
         }
 
@@ -120,19 +129,20 @@ impl ArchiveWriter for TarHandler {
     fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
         let file = File::create(archive_path)
             .with_context(|| format!("Failed to create archive: {}", archive_path.display()))?;
+        let buf_file = BufWriter::with_capacity(64 * 1024, file);
 
         let format = ArchiveFormat::from_path(archive_path)
             .unwrap_or(ArchiveFormat::Tar);
 
         let writer: Box<dyn Write> = match format {
-            ArchiveFormat::Tar => Box::new(file),
+            ArchiveFormat::Tar => Box::new(buf_file),
             ArchiveFormat::TarGz => {
                 let level = GzCompression::new(options.level.clamp(0, 9) as u32);
-                Box::new(GzEncoder::new(file, level))
+                Box::new(GzEncoder::new(buf_file, level))
             }
             ArchiveFormat::TarBz2 => {
                 let level = BzCompression::new(options.level.clamp(1, 9) as u32);
-                Box::new(BzEncoder::new(file, level))
+                Box::new(BzEncoder::new(buf_file, level))
             }
             _ => anyhow::bail!("Invalid tar archive target"),
         };

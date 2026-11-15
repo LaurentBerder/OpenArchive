@@ -28,24 +28,47 @@ pub struct CliArgs {
 }
 
 pub fn parse_dict_size(val: &str) -> Option<u32> {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    const MAX_U32: u64 = u32::MAX as u64;
+
     let s = val.trim().to_lowercase();
     if s.is_empty() {
         return None;
     }
-    if let Some(num) = s.strip_suffix("gb").or_else(|| s.strip_suffix('g')) {
-        num.trim().parse::<u32>().ok().and_then(|n| n.checked_mul(1024 * 1024 * 1024))
-    } else if let Some(num) = s.strip_suffix("mb").or_else(|| s.strip_suffix('m')) {
-        num.trim().parse::<u32>().ok().and_then(|n| n.checked_mul(1024 * 1024))
-    } else if let Some(num) = s.strip_suffix("kb").or_else(|| s.strip_suffix('k')) {
-        num.trim().parse::<u32>().ok().and_then(|n| n.checked_mul(1024))
-    } else if let Some(num) = s.strip_suffix('b') {
-        num.trim().parse::<u32>().ok()
-    } else if let Ok(n) = s.parse::<u32>() {
-        if n <= 32 {
-            // 7-Zip convention: bits (2^n)
-            1u32.checked_shl(n)
+
+    // 7-Zip's largest dictionary is 4 GB. `dict_size` is a u32, so represent
+    // exactly 4 GB with u32::MAX; LZMA2 clamps it to the largest encodable
+    // dictionary (4 GB - 16 bytes).
+    let clamp_4gb = |bytes: u64| -> Option<u32> {
+        if bytes <= MAX_U32 {
+            Some(bytes as u32)
+        } else if bytes == 4 * GB {
+            Some(u32::MAX)
         } else {
-            Some(n)
+            None
+        }
+    };
+
+    if let Some(num) = s.strip_suffix("gb").or_else(|| s.strip_suffix('g')) {
+        clamp_4gb(num.trim().parse::<u64>().ok()?.checked_mul(GB)?)
+    } else if let Some(num) = s.strip_suffix("mb").or_else(|| s.strip_suffix('m')) {
+        clamp_4gb(num.trim().parse::<u64>().ok()?.checked_mul(MB)?)
+    } else if let Some(num) = s.strip_suffix("kb").or_else(|| s.strip_suffix('k')) {
+        clamp_4gb(num.trim().parse::<u64>().ok()?.checked_mul(KB)?)
+    } else if let Some(num) = s.strip_suffix('b') {
+        clamp_4gb(num.trim().parse::<u64>().ok()?)
+    } else if let Ok(n) = s.parse::<u64>() {
+        if n <= 32 {
+            // 7-Zip convention: bit exponents, so 24 means 2^24 bytes.
+            if n == 32 {
+                Some(u32::MAX)
+            } else {
+                1u32.checked_shl(n as u32)
+            }
+        } else {
+            clamp_4gb(n)
         }
     } else {
         None
@@ -142,7 +165,11 @@ impl CliArgs {
                     if next_val == "on" || next_val == "+" || next_val == "yes" {
                         i += 1;
                         solid = true;
-                    } else if next_val == "off" || next_val == "-" || next_val == "no" || next_val == "e" {
+                    } else if next_val == "off"
+                        || next_val == "-"
+                        || next_val == "no"
+                        || next_val == "e"
+                    {
                         i += 1;
                         solid = false;
                     }
@@ -197,10 +224,16 @@ impl CliArgs {
             "t" | "test" => Command::Test,
             _ => {
                 let candidate = PathBuf::from(&command_str);
-                if candidate.exists() || command_str.ends_with(".7z") || command_str.ends_with(".zip") {
+                if candidate.exists()
+                    || command_str.ends_with(".7z")
+                    || command_str.ends_with(".zip")
+                {
                     Command::Gui(Some(candidate))
                 } else {
-                    return Err(format!("Unknown command: '{}'. Use 'a', 'x', 'e', 'l', 't', or 'gui'.", command_str));
+                    return Err(format!(
+                        "Unknown command: '{}'. Use 'a', 'x', 'e', 'l', 't', or 'gui'.",
+                        command_str
+                    ));
                 }
             }
         };
@@ -274,6 +307,14 @@ mod tests {
         // 7-Zip bit exponents (<= 32)
         assert_eq!(parse_dict_size("24"), Some(1 << 24)); // 16 MB
         assert_eq!(parse_dict_size("26"), Some(1 << 26)); // 64 MB
+        assert_eq!(parse_dict_size("31"), Some(1 << 31)); // 2 GB
+        // 4 GB is one past u32::MAX; it is clamped by the LZMA2 encoder.
+        assert_eq!(parse_dict_size("32"), Some(u32::MAX));
+        assert_eq!(parse_dict_size("4g"), Some(u32::MAX));
+        assert_eq!(parse_dict_size("4096m"), Some(u32::MAX));
+        assert_eq!(parse_dict_size("4294967296"), Some(u32::MAX));
+        assert_eq!(parse_dict_size("8g"), None);
+        assert_eq!(parse_dict_size("4294967297"), None);
         // Raw bytes (> 32)
         assert_eq!(parse_dict_size("1048576"), Some(1048576));
     }
@@ -300,28 +341,35 @@ mod tests {
 
     #[test]
     fn test_parse_solid_variations() {
-        let args_on = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms=on"]).unwrap();
+        let args_on =
+            CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms=on"]).unwrap();
         assert!(args_on.solid);
 
-        let args_off = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms=off"]).unwrap();
+        let args_off =
+            CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms=off"]).unwrap();
         assert!(!args_off.solid);
 
-        let args_e = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms=e"]).unwrap();
+        let args_e =
+            CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms=e"]).unwrap();
         assert!(!args_e.solid);
 
-        let args_minus = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms-"]).unwrap();
+        let args_minus =
+            CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-ms-"]).unwrap();
         assert!(!args_minus.solid);
     }
 
     #[test]
     fn test_parse_threads_variations() {
-        let args_1 = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-mmt=1"]).unwrap();
+        let args_1 =
+            CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-mmt=1"]).unwrap();
         assert_eq!(args_1.threads, Some(1));
 
-        let args_off = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-mmt=off"]).unwrap();
+        let args_off =
+            CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-mmt=off"]).unwrap();
         assert_eq!(args_off.threads, Some(1));
 
-        let args_on = CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-mmt=on"]).unwrap();
+        let args_on =
+            CliArgs::parse_from(["openarchive", "a", "test.7z", "file.txt", "-mmt=on"]).unwrap();
         assert!(args_on.threads.unwrap() >= 1);
     }
 }

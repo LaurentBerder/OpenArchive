@@ -110,6 +110,7 @@ pub struct ExtractOptions {
     pub flat: bool,
     pub password: Option<String>,
     pub overwrite: bool,
+    pub threads: Option<usize>,
 }
 
 impl Default for ExtractOptions {
@@ -119,6 +120,7 @@ impl Default for ExtractOptions {
             flat: false,
             password: None,
             overwrite: true,
+            threads: None,
         }
     }
 }
