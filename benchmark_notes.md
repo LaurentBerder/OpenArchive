@@ -396,7 +396,7 @@ No numerical performance advantage should be claimed until the benchmark has bee
 
 ## 12. OpenArchive Optimization Roadmap
 
-### Priority 1: Compression configuration [COMPLETED]
+### ~~Priority 1: Compression configuration~~ [COMPLETED]
 
 - [x] **Propagate compression levels:** Compression levels (`-mx={0..9}`) propagated across 7z, ZIP, TAR.GZ, and TAR.BZ2 writers. 7z level 0 uses COPY; levels 1–9 use LZMA2.
 - [x] **Expose LZMA2 presets:** Mapped level (1–9) to LZMA2 presets via `Lzma2Options::from_level` / `from_level_mt`; level 0 stores data with the COPY coder.
@@ -405,7 +405,7 @@ No numerical performance advantage should be claimed until the benchmark has bee
 - [x] **Configure thread counts:** Added `-mmt={N|on|off}` CLI switch and exposed `threads` in `CompressionOptions`.
 - [x] **Configure ZIP compression levels:** Passed compression level directly to `SimpleFileOptions::compression_level(...)` for Deflated and selected Stored for level 0.
 
-### Priority 2: Parallel processing [COMPLETED]
+### ~~Priority 2: Parallel processing~~ [COMPLETED]
 
 - [x] **Parallel LZMA2 compression (7z):** Replaced `sevenz-rust` 0.6 with `sevenz-rust2` 0.25. Files are grouped into solid blocks targeting 64 MB; a file that does not fit forms a block of its own. Block size and worker count are derived from a 256 MB in-flight budget, then each block is encoded on a scoped worker thread with `prepare_block` and appended in archive order with `push_prepared_block`. A sliding window limits workers to `N` blocks ahead of the writer. `-mmt={N|on|off}` selects the worker count; `-mmt=1` keeps a single solid block. Blocks larger than 256 MB (for example one huge file) take the streaming path with multi-threaded LZMA2 inside their own stream, so they are never buffered whole in memory.
   - **Preliminary validation** (Ryzen 5 7600, 6C/12T, 31.1 GB RAM, NTFS SSD, 7-Zip 26.06): 128 MB random dataset (32 × 4 MB), `-mx=5`, compression time fell from 45.77 s at `-mmt=1` to 7.98 s at `-mmt=8` (5.7×) and 7.55 s at `-mmt=12` (6.1×). On a 128 MB highly compressible text dataset, 4.34 s → 1.01 s (4.3×) with the same archive size. For reference, 7-Zip took 2.76 s → 0.66 s on the text dataset, so OpenArchive reaches about 65% of 7-Zip's throughput at both 1 and 8 threads with similar scaling.
@@ -415,7 +415,7 @@ No numerical performance advantage should be claimed until the benchmark has bee
 - [x] **Investigate parallel extraction:** Implemented parallel random-access extraction for ZIP archives using scoped worker threads, independent `ZipArchive` file handles (zero lock contention), and dynamic work distribution via `AtomicUsize`. For 7z, multi-block archives decode independent blocks concurrently with `BlockDecoder`; decode workers buffer entries and a single writer thread serializes disk writes, while single-block archives and flat extraction keep the ordered pipeline. Wired thread configuration switch (`-mmt`) into `ExtractOptions.threads`.
 - [x] **Parallelize independent file operations where safe:** Added upfront directory coverage and sequential pre-creation for 7z and ZIP handlers, eliminating directory races and redundant filesystem metadata lookups during parallel file writing. Integrated size-aware buffering (8 KB small reads, 256 KB sequential, 1 MB archive output) across all handlers. TAR remains sequential by design because the format is streamed; it should not be described as parallel.
 
-### Priority 3: Windows I/O [COMPLETED]
+### ~~Priority 3: Windows I/O~~ [COMPLETED]
 
 - [x] **Profile directory traversal:** Benchmarked creation on a 15,382-file / 31-directory / 15 MB fixture in store mode, where traversal, file open/close, and metadata dominate. Three runs, minimum warm-cache times before → after the I/O changes: ZIP store 1.58 s → 0.99 s, TAR 2.03 s → 1.09 s, 7z COPY 1.90 s → 1.53 s.
 - [x] **Reduce unnecessary filesystem operations:** Replaced `path.is_dir()` / `path.is_file()` in traversal loops with `DirEntry::file_type()` (no extra metadata call) and one size lookup from cached metadata. Symlinked entries retain a path-based fallback. Top-level inputs now use a single metadata call instead of separate `is_dir` / `is_file` checks.
@@ -424,7 +424,7 @@ No numerical performance advantage should be claimed until the benchmark has bee
 - [x] **Optimize handling of small files:** Decompressed entries below 64 KB are written directly instead of allocating a 64 KB `BufWriter` per file; 7z parallel workers write fully decoded buffers directly; compression readers no longer allocate a 64 KB buffer for every tiny file. This removes per-file buffer allocation and an extra copy on the small-file path.
   - **Note:** extraction wall time on a 1,000-file subset was effectively unchanged (31.66 s → 32.86 s) because Windows Defender scans each newly created file, which dominates the measurement. The allocation/copy reductions are real but not visible under that AV overhead.
 
-### Priority 4: Memory management [COMPLETED]
+### ~~Priority 4: Memory management~~ [COMPLETED]
 
 - [x] **Measure allocation frequency:** Added an ignored profiling harness (`tests/alloc_profile.rs`) that installs a counting global allocator and reports allocation count and peak live bytes. Run it with `cargo test --release --test alloc_profile -- --ignored --nocapture --test-threads=1`.
   - Before → after buffer reuse, 200 × 128 KiB ZIP: creation 4,042 → 3,843 allocations; extraction at 1 thread 3,230 → 3,034 and at 8 threads 9,747 → 9,551. The saved allocations are the per-file 256 KiB `BufReader`/`BufWriter` buffers.
@@ -435,7 +435,7 @@ No numerical performance advantage should be claimed until the benchmark has bee
 - [x] **Evaluate memory usage under multithreaded workloads:** Added two explicit budgets:
   - 7z prepared blocks: block size is capped by `min(64 MB, 256 MB / threads)` and worker count is capped by the largest block, so prepared output stays near the 256 MB budget rather than multiplying a 64 MB block by every thread.
   - 7z extraction queue: a 64 MB byte budget replaces the previous item-count-only bound. On 32 × 4 MB entries, peak working set fell from 163 MB to 111 MB at `-mmt=8` and from 162 MB to 110 MB at `-mmt=12`; `-mmt=1` stayed at ~51 MB.
-  - **Remaining caveat:** codec-internal memory is not budgeted. LZMA2 encoder memory scales with worker count and `-md` / compression level, so high thread counts at high levels can still use gigabytes. The measured figures above quantify that boundary; users can reduce `-mmt`, `-md`, or the level for lower memory.
+  - **Encoder memory:** budgeted separately in §15.2. Parallel 7z compression caps simultaneous LZMA2 encoders from their estimated dictionary/match-finder footprint (1.5 GiB budget); high levels automatically reduce the worker count. Prepared blocks, AES, and process overhead remain outside that budget.
 
 Every optimization must be validated against the benchmark suite.
 
@@ -516,7 +516,7 @@ The main engineering conclusion is that Rust itself is not the limiting factor. 
 
 Priority 1–4 are complete. The following work is beyond the original roadmap, ordered roughly by expected value.
 
-### 15.1 7z multi-block extraction [COMPLETED]
+### ~~15.1 7z multi-block extraction~~ [COMPLETED]
 
 Parallel extraction now decodes independent 7z blocks concurrently with `sevenz-rust2`'s `BlockDecoder`. Each decode worker owns an archive file handle; decoded entries up to 32 MB are buffered through the existing 64 MB byte budget and written by a single writer thread, avoiding the concurrent-write regression observed with real-time antivirus enabled. Larger entries stream directly under the writer lock. Single-block archives and flat extraction keep the ordered decode/write pipeline.
 
@@ -525,9 +525,14 @@ Parallel extraction now decodes independent 7z blocks concurrently with `sevenz-
 - **Interoperability:** encrypted multi-block archives, 7-Zip-created 8-block (`-ms=off`) archives, filtered extraction, and flat extraction all round-trip correctly.
 - **Caveat:** each decode worker allocates its own decoder dictionary/model, so memory scales with worker count and dictionary size. The 64 MB queue budget does not bound those decoder structures.
 
-### 15.2 Encoder-memory-aware 7z scheduling
+### ~~15.2 Encoder-memory-aware 7z scheduling~~ [COMPLETED]
 
-The prepared-block budget bounds buffered output, not LZMA2 encoder memory. Peak 7z compression was 103 MB at `-mmt=1`, 898 MB at `-mmt=8`, 1,062 MB at `-mmt=12` (`-mx=5`), and 1,831 MB at `-mx=9 -mmt=8` on 128 MB of random data. The next step is an estimated encoder-memory budget that reduces worker count at high levels/dictionaries, or an explicit memory-limit option. This trades speed for predictable memory on low-RAM machines.
+Implemented a 1.5 GiB encoder-memory budget for parallel 7z compression. The per-encoder estimate comes from `lzma-rust2`'s public `LzmaOptions::get_memory_usage()` using the effective preset and `-md` dictionary; the effective thread count is the minimum of the requested threads and the budget divided by that estimate. Multi-threaded LZMA2 inside a single oversized block uses the same effective count. Block sizing still follows the requested thread count, so capping the workers does not silently make individual blocks larger and more memory-hungry.
+
+- **Estimates:** level 5 → 92 MiB/encoder (cap 16), level 7 → 184 MiB (cap 8), level 8 → 368 MiB (cap 4), level 9 → 672 MiB (cap 2). Level 0 (COPY) has no encoder cap. Custom `-md` scales the estimate.
+- **Measured** (128 MB random data, `-mmt=8`): `-mx=9` changed from 1,831 MB working set / 7.1 s to 472 MB working set / 17.7 s, with 1.43 GB paged commit and 5.6 GB virtual. The estimate matches the observed paged commit closely. `-mx=8` uses 930 MB / 10.0 s.
+- **Trade-off:** high compression levels now sacrifice concurrency for predictable memory. Level 5 remains uncapped at 8–12 threads (cap 16). A smaller machine or a tighter budget can be accommodated by lowering `-mx`, `-md`, or `-mmt`.
+- **Caveat:** the budget covers LZMA2 encoder structures only; prepared blocks, AES, and process overhead are additional. The estimate is conservative relative to working set because dictionary pages are not all resident at once.
 
 ### 15.3 ZIP large-file parallelism
 

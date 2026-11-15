@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use lzma_rust2::{DICT_SIZE_MAX, DICT_SIZE_MIN, LzmaOptions};
 use sevenz_rust2::encoder_options::{AesEncoderOptions, EncoderOptions, Lzma2Options};
 use sevenz_rust2::{
     ArchiveEntry as SzEntry, ArchiveReader as SzReader, ArchiveWriter as SzWriter, BlockDecoder,
@@ -26,6 +27,11 @@ const MAX_PREPARED_BLOCK: u64 = 256 * MB;
 /// count are both derived from this so a large archive cannot multiply the
 /// per-block cap by the thread count.
 const MAX_INFLIGHT_BYTES: u64 = 256 * MB;
+
+/// Budget for LZMA2 encoder structures across workers. This is separate from
+/// the prepared-output budget: an encoder's dictionary and match finder can be
+/// much larger than the compressed block it produces.
+const ENCODER_MEMORY_BUDGET_KIB: u64 = 1536 * 1024;
 
 /// Target maximum size of one solid block when compressing in parallel.
 /// Smaller blocks improve load balancing and bound peak memory; larger blocks
@@ -630,6 +636,28 @@ fn prepared_worker_count(blocks: &[Block], num_threads: usize) -> usize {
     num_threads.min(blocks.len()).min(by_memory).max(1)
 }
 
+fn lzma2_encoder_memory_kib(level: u8, dict_size: Option<u32>) -> u64 {
+    if level == 0 {
+        return 0; // COPY: no LZMA2 encoder state.
+    }
+
+    let mut options = LzmaOptions::with_preset(level as u32);
+    if let Some(dict_size) = dict_size {
+        options.dict_size = dict_size.clamp(DICT_SIZE_MIN, DICT_SIZE_MAX);
+    }
+    options.get_memory_usage() as u64
+}
+
+/// Maximum simultaneous LZMA2 encoders allowed by the encoder-memory budget.
+fn encoder_worker_cap(level: u8, dict_size: Option<u32>) -> usize {
+    let per_worker = lzma2_encoder_memory_kib(level, dict_size);
+    if per_worker == 0 {
+        return usize::MAX;
+    }
+
+    (ENCODER_MEMORY_BUDGET_KIB / per_worker).max(1) as usize
+}
+
 /// Group files into solid blocks. A file is never split across blocks, so an
 /// oversized file simply forms a block of its own.
 fn build_blocks(items: Vec<FileItem>, solid: bool, num_threads: usize) -> Vec<Block> {
@@ -846,6 +874,12 @@ impl ArchiveWriter for SevenZHandler {
             })
             .max(1);
 
+        // Dictionary and match-finder memory can dominate a worker's footprint.
+        // Scale the effective thread count before choosing block sizes so high
+        // levels do not multiply codec memory by the requested thread count.
+        let encoder_workers = encoder_worker_cap(level, options.dict_size);
+        let effective_threads = num_threads.min(encoder_workers).max(1);
+
         let single_methods =
             content_methods(level, options.dict_size, options.password.as_deref(), 1);
 
@@ -917,6 +951,9 @@ impl ArchiveWriter for SevenZHandler {
             writer.push_archive_entry(dir_entry, None::<&[u8]>)?;
         }
 
+        // Block sizing follows the requested thread count so capping workers
+        // does not silently produce much larger (and more memory-hungry)
+        // blocks; the worker cap only reduces concurrency.
         let blocks = build_blocks(file_items, options.solid, num_threads);
         if blocks.is_empty() {
             let mut output = writer.finish()?;
@@ -930,9 +967,10 @@ impl ArchiveWriter for SevenZHandler {
         let has_oversized_block = blocks
             .iter()
             .any(|b| block_uncompressed_size(b) > MAX_PREPARED_BLOCK);
-        let prepared_workers = prepared_worker_count(&blocks, num_threads);
+        let prepared_workers = prepared_worker_count(&blocks, effective_threads);
 
-        if num_threads > 1 && blocks.len() > 1 && prepared_workers > 1 && !has_oversized_block {
+        if effective_threads > 1 && blocks.len() > 1 && prepared_workers > 1 && !has_oversized_block
+        {
             // Parallel solid blocks: every block is encoded on a worker and
             // appended in order by the writer thread.
             let methods = Arc::new(single_methods);
@@ -943,12 +981,12 @@ impl ArchiveWriter for SevenZHandler {
             // their own stream, which keeps memory bounded.
             for block in blocks {
                 let size = block_uncompressed_size(&block);
-                let methods = if num_threads > 1 && size >= MT_BLOCK_THRESHOLD {
+                let methods = if effective_threads > 1 && size >= MT_BLOCK_THRESHOLD {
                     content_methods(
                         level,
                         options.dict_size,
                         options.password.as_deref(),
-                        num_threads,
+                        effective_threads,
                     )
                 } else {
                     single_methods.clone()
@@ -1022,5 +1060,17 @@ mod tests {
         assert!(budget.reserve(4, &error));
         budget.release(6);
         assert!(budget.reserve(6, &error));
+    }
+
+    #[test]
+    fn encoder_memory_cap_scales_with_level_and_dictionary() {
+        assert_eq!(encoder_worker_cap(0, None), usize::MAX);
+        assert!(encoder_worker_cap(5, None) >= 8);
+        assert!(encoder_worker_cap(9, None) <= 3);
+        assert!(lzma2_encoder_memory_kib(9, None) > lzma2_encoder_memory_kib(5, None));
+        assert!(
+            encoder_worker_cap(5, Some(64 * 1024 * 1024))
+                < encoder_worker_cap(5, Some(16 * 1024 * 1024))
+        );
     }
 }
