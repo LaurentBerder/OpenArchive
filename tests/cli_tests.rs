@@ -393,6 +393,44 @@ fn test_tar_roundtrip_formats() {
 }
 
 #[test]
+fn test_tar_large_entries_use_sequential_path() {
+    let test_dir = "test_data_tar_large_entries";
+    fs::create_dir_all(test_dir).unwrap();
+    let first = vec![0x11; 2 * 1024 * 1024];
+    let second = vec![0x22; 2 * 1024 * 1024];
+    fs::write(format!("{}/first.bin", test_dir), &first).unwrap();
+    fs::write(format!("{}/second.bin", test_dir), &second).unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+
+    let created = Command::new(exe)
+        .args(["a", "archive_large_entries.tar", test_dir])
+        .status()
+        .unwrap();
+    assert!(created.success());
+
+    let extracted = Command::new(exe)
+        .args([
+            "x",
+            "archive_large_entries.tar",
+            "-o",
+            "out_tar_large_entries",
+            "-mmt=4",
+        ])
+        .status()
+        .unwrap();
+    assert!(extracted.success());
+
+    let base = PathBuf::from("out_tar_large_entries").join(test_dir);
+    assert_eq!(fs::read(base.join("first.bin")).unwrap(), first);
+    assert_eq!(fs::read(base.join("second.bin")).unwrap(), second);
+
+    let _ = fs::remove_dir_all(test_dir);
+    let _ = fs::remove_dir_all("out_tar_large_entries");
+    let _ = fs::remove_file("archive_large_entries.tar");
+}
+
+#[test]
 fn test_zip_parallel_roundtrip() {
     let test_dir = "test_data_zip_parallel";
     fs::create_dir_all(format!("{}/sub1", test_dir)).unwrap();

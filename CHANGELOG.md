@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 7z compression now encodes solid blocks concurrently across `-mmt` worker threads using `sevenz-rust2`'s `prepare_block` / `push_prepared_block`; blocks are appended in archive order from the writer thread.
 - A single oversized 7z block (for example one huge file) uses multi-threaded LZMA2 inside its own stream, with memory bounded by the chunk size.
 - ZIP compression now batches files by uncompressed bytes (and entry count), uses a sliding window to bound the reorder buffer, and spills oversized batches to temporary sub-archives so large files compress in parallel without unbounded RAM.
+- Plain TAR extraction now indexes entry offsets and extracts small-file archives in parallel; large-entry archives stay sequential to avoid concurrent-write regressions under Windows AV. Flat, compressed, linked/special, and duplicate-name archives use the ordered path.
 - TAR creation now writes explicit GNU headers from opened-file metadata and uses the shared sequential/buffered I/O path instead of `tar::Builder::append_path_with_name` / `append_dir`.
 - Windows I/O: traversal uses `DirEntry` file types instead of extra metadata calls; file reads use size-aware 8 KB/256 KB buffers with `FILE_FLAG_SEQUENTIAL_SCAN`; archive writers use 1 MB output buffers; small extracted entries are written directly.
 - 7z compression now caps simultaneous LZMA2 encoders against a 1.5 GiB estimated encoder-memory budget, reducing effective worker count at high levels or large `-md` dictionaries.

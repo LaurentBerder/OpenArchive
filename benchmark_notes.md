@@ -549,8 +549,10 @@ Oversized ZIP batches now spill to unique temporary sub-archives instead of forc
   - **Validation:** roundtrip tests cover `.tar`, `.tar.gz`, and `.tar.bz2` with empty files, a 256 KB payload, and a long path. All formats pass `7z t`, and `bsdtar -tf` lists the expected entries.
   - **Benchmark:** on an 879-file / 785 MB tree, TAR creation improved from 13.36 s to 12.94 s (minimum of two runs). A 782-file / 15 MB tree was noise-dominated by Defender and showed no clear win.
   - **Caveat:** `append_data` does not emit sparse-file headers, so sparse files are stored as regular entries. File contents remain correct; only the on-disk sparse representation is lost.
-- [ ] **TAR extraction** remains sequential by format design.
-- [ ] **TAR.GZ / TAR.BZ2 compression** remains single-threaded (`flate2` / `bzip2`); a pigz-style multi-member gzip implementation or a faster backend is a separate project.
+- [x] ~~Plain TAR extraction (small-file archives)~~ [COMPLETED]: TAR extraction indexes entry data offsets with `entries_with_seek`, then uses independent file handles and workers for archives whose average entry is below 1 MB. Large-entry archives reuse the already-open handle and copy sequentially; flat extraction, links/special entries, duplicate names, and compressed TAR fall back to the ordered path. This matches the practical 7-Zip behavior: independent uncompressed entries can be extracted in parallel, while large concurrent writes on Windows/AV do not pay off.
+  - **Validation:** 782-file / 15.9 MB TAR extracted in 36.9 s vs 55.9 s sequentially in the cleanest run (~1.5×); repeated runs were 1.3–1.6× faster. A 64 × 4 MB large-entry archive stays on the sequential path. Tests cover small files, large files, empty files, long paths, filters, and the compressed formats.
+  - **Why the size split:** concurrent creation of many small files benefits from workers; concurrent writes of large files were slower with real-time antivirus scanning.
+- [ ] **TAR.GZ / TAR.BZ2 compression** remains single-threaded (`flate2` / `bzip2`); a pigz-style multi-member gzip implementation or a faster backend is a separate project. Compressed TAR extraction also remains decode-sequential.
 
 ### 15.5 Deeper Windows I/O
 

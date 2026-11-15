@@ -7,8 +7,10 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write, copy, empty, sink};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, copy, empty, sink};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tar::Header;
 use walkdir::WalkDir;
 
@@ -16,6 +18,16 @@ use crate::core::io as file_io;
 use crate::core::{
     ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions,
 };
+
+struct TarIndexItem {
+    offset: u64,
+    size: u64,
+    target: PathBuf,
+}
+
+/// Concurrent writes of large files tend to be slower on Windows with
+/// real-time antivirus scanning; large writes are serialized instead.
+const LARGE_TAR_ENTRY_BYTES: u64 = 1024 * 1024;
 
 pub struct TarHandler {
     path: PathBuf,
@@ -40,6 +52,158 @@ impl TarHandler {
             ArchiveFormat::TarBz2 => Ok(Box::new(BzDecoder::new(buf_file))),
             _ => anyhow::bail!("Unsupported tar format variant"),
         }
+    }
+
+    /// Extract a plain (uncompressed, seekable) TAR by indexing entry offsets
+    /// first and then copying each entry from an independent file handle.
+    /// Returns false when the archive contains something the parallel path does
+    /// not preserve (links, special entries, duplicate names), so the caller can
+    /// fall back to sequential extraction.
+    fn try_extract_plain_parallel(
+        &self,
+        options: &ExtractOptions,
+        filter: Option<&[String]>,
+        num_threads: usize,
+    ) -> Result<bool> {
+        if self.format != ArchiveFormat::Tar || options.flat {
+            return Ok(false);
+        }
+
+        let file = File::open(&self.path)
+            .with_context(|| format!("Failed to open archive: {}", self.path.display()))?;
+        let mut archive = tar::Archive::new(file);
+
+        let mut dirs: HashSet<PathBuf> = HashSet::new();
+        dirs.insert(options.output_dir.clone());
+        let mut files: Vec<TarIndexItem> = Vec::new();
+        let mut targets: HashSet<PathBuf> = HashSet::new();
+
+        for entry in archive.entries_with_seek()? {
+            let entry = entry?;
+            let name = entry.path()?.to_string_lossy().to_string();
+
+            if let Some(filters) = filter {
+                if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
+                    continue;
+                }
+            }
+
+            let target_path = options.output_dir.join(&name);
+            let entry_type = entry.header().entry_type();
+
+            if entry_type.is_dir() {
+                dirs.insert(target_path);
+            } else if entry_type.is_file() {
+                if let Some(parent) = target_path.parent() {
+                    dirs.insert(parent.to_path_buf());
+                }
+                if !targets.insert(target_path.clone()) {
+                    return Ok(false);
+                }
+                files.push(TarIndexItem {
+                    offset: entry.raw_file_position(),
+                    size: entry.size(),
+                    target: target_path,
+                });
+            } else {
+                return Ok(false);
+            }
+        }
+
+        if files.is_empty() {
+            for dir in &dirs {
+                fs::create_dir_all(dir)?;
+            }
+            return Ok(true);
+        }
+
+        let total_size = files
+            .iter()
+            .fold(0u64, |acc, item| acc.saturating_add(item.size));
+        let average_size = total_size / files.len() as u64;
+
+        for dir in &dirs {
+            fs::create_dir_all(dir)?;
+        }
+
+        if average_size >= LARGE_TAR_ENTRY_BYTES {
+            // Large concurrent writes hurt more than the parallelism helps on
+            // Windows/AV. Reuse the already-open handle and copy sequentially
+            // instead of reopening and rescanning the archive.
+            let mut source = archive.into_inner();
+            for item in &files {
+                source.seek(SeekFrom::Start(item.offset))?;
+                let mut reader = Read::by_ref(&mut source).take(item.size);
+                file_io::copy_to_file(&mut reader, &item.target, item.size)?;
+            }
+            return Ok(true);
+        }
+
+        drop(archive);
+
+        let worker_count = num_threads.min(files.len()).max(1);
+        let next_index = AtomicUsize::new(0);
+        let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let large_write_lock = Mutex::new(());
+        let archive_path = &self.path;
+        let files_ref = &files;
+
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                scope.spawn(|| {
+                    let mut source = match File::open(archive_path) {
+                        Ok(file) => file,
+                        Err(e) => {
+                            let mut guard = first_err.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(e.into());
+                            }
+                            return;
+                        }
+                    };
+
+                    loop {
+                        if first_err.lock().unwrap().is_some() {
+                            break;
+                        }
+
+                        let index = next_index.fetch_add(1, Ordering::Relaxed);
+                        if index >= files_ref.len() {
+                            break;
+                        }
+
+                        let item = &files_ref[index];
+                        let result: Result<()> = (|| {
+                            source.seek(SeekFrom::Start(item.offset))?;
+                            // Serialize large writes; small files still run
+                            // concurrently across workers.
+                            let _large_guard = if item.size >= LARGE_TAR_ENTRY_BYTES {
+                                Some(large_write_lock.lock().unwrap())
+                            } else {
+                                None
+                            };
+                            let mut reader = Read::by_ref(&mut source).take(item.size);
+                            file_io::copy_to_file(&mut reader, &item.target, item.size)?;
+                            Ok(())
+                        })();
+
+                        if let Err(e) = result {
+                            let mut guard = first_err.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(e);
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        if let Some(err) = first_err.into_inner().unwrap() {
+            return Err(err);
+        }
+
+        Ok(true)
     }
 }
 
@@ -70,6 +234,19 @@ impl ArchiveReader for TarHandler {
     }
 
     fn extract(&mut self, options: &ExtractOptions, filter: Option<&[String]>) -> Result<()> {
+        let num_threads = options
+            .threads
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            })
+            .max(1);
+
+        if num_threads > 1 && self.try_extract_plain_parallel(options, filter, num_threads)? {
+            return Ok(());
+        }
+
         let reader = self.open_reader()?;
         let mut archive = tar::Archive::new(reader);
 
