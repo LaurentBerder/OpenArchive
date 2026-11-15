@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use walkdir::WalkDir;
 
+use crate::core::io as file_io;
 use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
 
 const MB: u64 = 1024 * 1024;
@@ -40,14 +41,16 @@ const MT_CHUNK_SIZE: u64 = 32 * MB;
 
 struct LazyFileReader {
     path: PathBuf,
+    buffer_capacity: usize,
     reader: Option<BufReader<File>>,
     end: bool,
 }
 
 impl LazyFileReader {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, size: u64) -> Self {
         Self {
             path,
+            buffer_capacity: file_io::read_buffer_capacity(size),
             reader: None,
             end: false,
         }
@@ -60,8 +63,8 @@ impl Read for LazyFileReader {
             return Ok(0);
         }
         if self.reader.is_none() {
-            let f = File::open(&self.path)?;
-            self.reader = Some(BufReader::with_capacity(64 * 1024, f));
+            let f = file_io::open_sequential(&self.path)?;
+            self.reader = Some(BufReader::with_capacity(self.buffer_capacity, f));
         }
         let n = self.reader.as_mut().unwrap().read(buf)?;
         if n == 0 {
@@ -183,10 +186,7 @@ impl ArchiveReader for SevenZHandler {
                         options.output_dir.join(name)
                     };
 
-                    let out_file = File::create(&target_path)?;
-                    let mut buf_out = BufWriter::with_capacity(64 * 1024, out_file);
-                    copy(stream, &mut buf_out)?;
-                    buf_out.flush()?;
+                    file_io::copy_to_file(stream, &target_path, entry.size())?;
                 }
 
                 Ok(true)
@@ -217,13 +217,8 @@ impl ArchiveReader for SevenZHandler {
                                 break;
                             };
 
-                            let res: Result<()> = (|| {
-                                let out_file = File::create(&target_path)?;
-                                let mut buf_out = BufWriter::with_capacity(64 * 1024, out_file);
-                                buf_out.write_all(&data)?;
-                                buf_out.flush()?;
-                                Ok(())
-                            })();
+                            let res: Result<()> =
+                                file_io::write_buffer(&target_path, &data).map_err(Into::into);
 
                             if let Err(e) = res {
                                 let mut g = first_err.lock().unwrap();
@@ -264,11 +259,9 @@ impl ArchiveReader for SevenZHandler {
                                 return Ok(false);
                             }
                         } else {
-                            // Large files streamed directly with 128KB buffer
-                            let out_file = File::create(&target_path)?;
-                            let mut buf_out = BufWriter::with_capacity(128 * 1024, out_file);
-                            copy(stream, &mut buf_out)?;
-                            buf_out.flush()?;
+                            // Large files streamed directly; small ones were
+                            // handled by the bounded pipeline above.
+                            file_io::copy_to_file(stream, &target_path, entry.size())?;
                         }
                     }
 
@@ -494,7 +487,9 @@ fn push_prepared_blocks<W: Write + Seek>(
                         blocks[idx].iter().map(|item| item.entry.clone()).collect();
                     let readers: Vec<SourceReader<LazyFileReader>> = blocks[idx]
                         .iter()
-                        .map(|item| SourceReader::new(LazyFileReader::new(item.path.clone())))
+                        .map(|item| {
+                            SourceReader::new(LazyFileReader::new(item.path.clone(), item.size))
+                        })
                         .collect();
 
                     let prepared = prepare_block(methods.clone(), entries, readers)
@@ -566,7 +561,10 @@ impl ArchiveWriter for SevenZHandler {
         let single_methods =
             content_methods(level, options.dict_size, options.password.as_deref(), 1);
 
-        let mut writer = SzWriter::create(archive_path)
+        let file = File::create(archive_path)
+            .with_context(|| format!("Failed to create 7z archive: {}", archive_path.display()))?;
+        let buffered = BufWriter::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
+        let mut writer = SzWriter::new(buffered)
             .with_context(|| format!("Failed to create 7z archive: {}", archive_path.display()))?;
         writer.set_content_methods(single_methods.clone());
 
@@ -575,36 +573,53 @@ impl ArchiveWriter for SevenZHandler {
         let mut file_items: Vec<FileItem> = Vec::new();
 
         for target in files {
-            if target.is_dir() {
+            let Ok(target_meta) = target.metadata() else {
+                continue;
+            };
+
+            if target_meta.is_dir() {
                 let base = target.parent().unwrap_or(target);
                 for entry in WalkDir::new(target) {
                     let entry = entry?;
                     let path = entry.path();
                     let rel_path = path.strip_prefix(base).unwrap_or(path);
                     let rel_name = rel_path.to_string_lossy().replace('\\', "/");
+                    let file_type = entry.file_type();
 
-                    if path.is_dir() {
+                    if file_type.is_dir() {
                         dir_entries.push(SzEntry::from_path(path, rel_name));
-                    } else if path.is_file() {
+                    } else if file_type.is_file() {
                         let size = entry.metadata()?.len();
                         file_items.push(FileItem {
                             entry: SzEntry::from_path(path, rel_name),
                             path: path.to_path_buf(),
                             size,
                         });
+                    } else if file_type.is_symlink() {
+                        // Preserve the previous path-based behavior for
+                        // symlinked files and directories.
+                        if path.is_dir() {
+                            dir_entries.push(SzEntry::from_path(path, rel_name));
+                        } else if path.is_file() {
+                            let size = path.metadata()?.len();
+                            file_items.push(FileItem {
+                                entry: SzEntry::from_path(path, rel_name),
+                                path: path.to_path_buf(),
+                                size,
+                            });
+                        }
                     }
                 }
-            } else if target.is_file() {
+            } else if target_meta.is_file() {
                 let file_name = target
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                let size = target.metadata()?.len();
                 file_items.push(FileItem {
                     entry: SzEntry::from_path(target, file_name),
                     path: target.clone(),
-                    size,
+                    size: target_meta.len(),
                 });
             }
         }
@@ -616,7 +631,8 @@ impl ArchiveWriter for SevenZHandler {
 
         let blocks = build_blocks(file_items, options.solid, num_threads);
         if blocks.is_empty() {
-            writer.finish()?;
+            let mut output = writer.finish()?;
+            output.flush()?;
             return Ok(());
         }
 
@@ -654,13 +670,14 @@ impl ArchiveWriter for SevenZHandler {
                 let mut readers = Vec::with_capacity(block.len());
                 for item in block {
                     entries.push(item.entry);
-                    readers.push(SourceReader::new(LazyFileReader::new(item.path)));
+                    readers.push(SourceReader::new(LazyFileReader::new(item.path, item.size)));
                 }
                 writer.push_archive_entries(entries, readers)?;
             }
         }
 
-        writer.finish()?;
+        let mut output = writer.finish()?;
+        output.flush()?;
         Ok(())
     }
 }

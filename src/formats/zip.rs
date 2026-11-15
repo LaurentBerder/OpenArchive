@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Cursor, Write, copy, sink};
+use std::io::{BufWriter, Cursor, Seek, Write, copy, sink};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::core::io as file_io;
 use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
 
 /// Target uncompressed size of one parallel ZIP batch. The compressed batch is
@@ -125,7 +126,7 @@ impl ArchiveReader for ZipHandler {
         // 1. Collect directories and filtered file entries
         let mut dirs_to_create: HashSet<PathBuf> = HashSet::new();
         dirs_to_create.insert(options.output_dir.clone());
-        let mut files_to_extract: Vec<(usize, PathBuf)> = Vec::new();
+        let mut files_to_extract: Vec<(usize, PathBuf, u64)> = Vec::new();
 
         for i in 0..archive.len() {
             let file = archive.by_index(i)?;
@@ -152,7 +153,7 @@ impl ArchiveReader for ZipHandler {
                 if let Some(parent) = target_path.parent() {
                     dirs_to_create.insert(parent.to_path_buf());
                 }
-                files_to_extract.push((i, target_path));
+                files_to_extract.push((i, target_path, file.size()));
             }
         }
 
@@ -179,16 +180,13 @@ impl ArchiveReader for ZipHandler {
 
         if num_threads <= 1 || files_to_extract.len() <= 1 {
             // Sequential path
-            for (i, target_path) in files_to_extract {
+            for (i, target_path, size) in files_to_extract {
                 let mut file = if let Some(p) = pass {
                     archive.by_index_decrypt(i, p.as_bytes())?
                 } else {
                     archive.by_index(i)?
                 };
-                let out_file = File::create(&target_path)?;
-                let mut buf_out = BufWriter::with_capacity(64 * 1024, out_file);
-                copy(&mut file, &mut buf_out)?;
-                buf_out.flush()?;
+                file_io::copy_to_file(&mut file, &target_path, size)?;
             }
         } else {
             // Parallel extraction: each worker thread has an independent archive handle
@@ -231,17 +229,14 @@ impl ArchiveReader for ZipHandler {
                             if idx >= files_ref.len() {
                                 break;
                             }
-                            let (entry_idx, ref target_path) = files_ref[idx];
+                            let (entry_idx, ref target_path, size) = files_ref[idx];
                             let res: Result<()> = (|| {
                                 let mut file = if let Some(ref p) = pass {
                                     arch.by_index_decrypt(entry_idx, p.as_bytes())?
                                 } else {
                                     arch.by_index(entry_idx)?
                                 };
-                                let out_file = File::create(target_path)?;
-                                let mut buf_out = BufWriter::with_capacity(64 * 1024, out_file);
-                                copy(&mut file, &mut buf_out)?;
-                                buf_out.flush()?;
+                                file_io::copy_to_file(&mut file, target_path, size)?;
                                 Ok(())
                             })();
 
@@ -292,8 +287,8 @@ impl ArchiveReader for ZipHandler {
 /// prevents workers from running more than `worker_count` batches ahead of the
 /// merger, so the reorder buffer can never grow beyond the in-flight batch
 /// budget; batches are themselves size-limited by the caller.
-fn push_parallel_batches(
-    writer: &mut ZipWriter<File>,
+fn push_parallel_batches<W: Write + Seek>(
+    writer: &mut ZipWriter<W>,
     batches: Vec<Vec<ZipItem>>,
     file_options: SimpleFileOptions,
     worker_count: usize,
@@ -354,9 +349,7 @@ fn push_parallel_batches(
                         let mut sub_writer = ZipWriter::new(cursor);
                         for item in batch {
                             sub_writer.start_file(item.name.clone(), file_options)?;
-                            let f = File::open(&item.path)?;
-                            let mut buf_f = BufReader::with_capacity(64 * 1024, f);
-                            copy(&mut buf_f, &mut sub_writer)?;
+                            file_io::copy_file_to(&item.path, item.size, &mut sub_writer)?;
                         }
                         Ok(sub_writer.finish()?)
                     })();
@@ -422,7 +415,8 @@ impl ArchiveWriter for ZipHandler {
     fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
         let file = File::create(archive_path)
             .with_context(|| format!("Failed to create zip file: {}", archive_path.display()))?;
-        let mut writer = ZipWriter::new(file);
+        let buffered = BufWriter::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
+        let mut writer = ZipWriter::new(buffered);
 
         let (method, comp_level) = if options.level == 0 {
             (CompressionMethod::Stored, None)
@@ -441,30 +435,51 @@ impl ArchiveWriter for ZipHandler {
         let mut file_items: Vec<ZipItem> = Vec::new();
 
         for target in files {
-            if target.is_dir() {
+            let Ok(target_meta) = target.metadata() else {
+                continue;
+            };
+
+            if target_meta.is_dir() {
                 let base = target.parent().unwrap_or(target);
                 for entry in WalkDir::new(target) {
                     let entry = entry?;
                     let path = entry.path();
                     let rel_path = path.strip_prefix(base).unwrap_or(path);
                     let rel_name = rel_path.to_string_lossy().replace('\\', "/");
+                    let file_type = entry.file_type();
 
-                    if path.is_dir() {
+                    if file_type.is_dir() {
                         let dir_name = if rel_name.ends_with('/') {
                             rel_name
                         } else {
                             format!("{}/", rel_name)
                         };
                         dir_entries.push(dir_name);
-                    } else if path.is_file() {
+                    } else if file_type.is_file() {
                         file_items.push(ZipItem {
                             path: path.to_path_buf(),
                             name: rel_name,
                             size: entry.metadata()?.len(),
                         });
+                    } else if file_type.is_symlink() {
+                        // Preserve path-based handling for symlinked inputs.
+                        if path.is_dir() {
+                            let dir_name = if rel_name.ends_with('/') {
+                                rel_name
+                            } else {
+                                format!("{}/", rel_name)
+                            };
+                            dir_entries.push(dir_name);
+                        } else if path.is_file() {
+                            file_items.push(ZipItem {
+                                path: path.to_path_buf(),
+                                name: rel_name,
+                                size: path.metadata()?.len(),
+                            });
+                        }
                     }
                 }
-            } else if target.is_file() {
+            } else if target_meta.is_file() {
                 let file_name = target
                     .file_name()
                     .unwrap_or_default()
@@ -473,7 +488,7 @@ impl ArchiveWriter for ZipHandler {
                 file_items.push(ZipItem {
                     path: target.clone(),
                     name: file_name,
-                    size: target.metadata()?.len(),
+                    size: target_meta.len(),
                 });
             }
         }
@@ -484,7 +499,8 @@ impl ArchiveWriter for ZipHandler {
         }
 
         if file_items.is_empty() {
-            writer.finish()?;
+            let mut output = writer.finish()?;
+            output.flush()?;
             return Ok(());
         }
 
@@ -513,9 +529,7 @@ impl ArchiveWriter for ZipHandler {
             // bounded regardless of input size.
             for item in file_items {
                 writer.start_file(item.name, file_options)?;
-                let f = File::open(&item.path)?;
-                let mut buf_f = BufReader::with_capacity(64 * 1024, f);
-                copy(&mut buf_f, &mut writer)?;
+                file_io::copy_file_to(&item.path, item.size, &mut writer)?;
             }
         } else {
             // Parallel bounded producer-consumer pipeline.
@@ -528,7 +542,8 @@ impl ArchiveWriter for ZipHandler {
             push_parallel_batches(&mut writer, batches, file_options, worker_count)?;
         }
 
-        writer.finish()?;
+        let mut output = writer.finish()?;
+        output.flush()?;
         Ok(())
     }
 }

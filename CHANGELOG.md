@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 7z compression now encodes solid blocks concurrently across `-mmt` worker threads using `sevenz-rust2`'s `prepare_block` / `push_prepared_block`; blocks are appended in archive order from the writer thread.
 - A single oversized 7z block (for example one huge file) uses multi-threaded LZMA2 inside its own stream, with memory bounded by the chunk size.
 - ZIP compression now batches files by uncompressed bytes (and entry count), uses a sliding window to bound the reorder buffer, and streams files larger than the batch limit instead of buffering them.
+- Windows I/O: traversal uses `DirEntry` file types instead of extra metadata calls; file reads use size-aware 8 KB/256 KB buffers with `FILE_FLAG_SEQUENTIAL_SCAN`; archive writers use 1 MB output buffers; small extracted entries are written directly.
 - Migrated the 7z backend from `sevenz-rust` 0.6 to `sevenz-rust2` 0.25.
 
 ### Fixed
@@ -20,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ZIP parallel compression can no longer accumulate an unbounded reorder buffer; in-flight batch data is capped at 256 MB.
 - `-mx=0` now stores 7z entries with the COPY method, matching 7-Zip.
 - `-md` now accepts the 4 GB maximum (`-md=32`, `-md=4g`) instead of silently failing to parse.
+- Removed redundant metadata syscalls and per-file 64 KB buffer allocations on small-file archive creation and extraction paths.
 
 ---
 

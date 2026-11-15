@@ -1,17 +1,20 @@
-use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{copy, sink, BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
+use bzip2::Compression as BzCompression;
 use bzip2::read::BzDecoder;
 use bzip2::write::BzEncoder;
-use bzip2::Compression as BzCompression;
+use flate2::Compression as GzCompression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression as GzCompression;
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Write, copy, sink};
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-use crate::core::{ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
+use crate::core::io as file_io;
+use crate::core::{
+    ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions,
+};
 
 pub struct TarHandler {
     path: PathBuf,
@@ -27,9 +30,9 @@ impl TarHandler {
     }
 
     fn open_reader(&self) -> Result<Box<dyn Read>> {
-        let file = File::open(&self.path)
+        let file = file_io::open_sequential(&self.path)
             .with_context(|| format!("Failed to open archive: {}", self.path.display()))?;
-        let buf_file = BufReader::with_capacity(64 * 1024, file);
+        let buf_file = BufReader::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
         match self.format {
             ArchiveFormat::Tar => Ok(Box::new(buf_file)),
             ArchiveFormat::TarGz => Ok(Box::new(GzDecoder::new(buf_file))),
@@ -101,10 +104,8 @@ impl ArchiveReader for TarHandler {
                         fs::create_dir_all(parent)?;
                     }
                 }
-                let out = File::create(&target_path)?;
-                let mut buf_out = BufWriter::with_capacity(64 * 1024, out);
-                copy(&mut entry, &mut buf_out)?;
-                buf_out.flush()?;
+                let size = entry.size();
+                file_io::copy_to_file(&mut entry, &target_path, size)?;
             }
         }
 
@@ -129,10 +130,9 @@ impl ArchiveWriter for TarHandler {
     fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
         let file = File::create(archive_path)
             .with_context(|| format!("Failed to create archive: {}", archive_path.display()))?;
-        let buf_file = BufWriter::with_capacity(64 * 1024, file);
+        let buf_file = BufWriter::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
 
-        let format = ArchiveFormat::from_path(archive_path)
-            .unwrap_or(ArchiveFormat::Tar);
+        let format = ArchiveFormat::from_path(archive_path).unwrap_or(ArchiveFormat::Tar);
 
         let writer: Box<dyn Write> = match format {
             ArchiveFormat::Tar => Box::new(buf_file),
@@ -150,27 +150,43 @@ impl ArchiveWriter for TarHandler {
         let mut builder = tar::Builder::new(writer);
 
         for target in files {
-            if target.is_dir() {
+            let Ok(target_meta) = target.metadata() else {
+                continue;
+            };
+
+            if target_meta.is_dir() {
                 let base = target.parent().unwrap_or(target);
                 for entry in WalkDir::new(target) {
                     let entry = entry?;
                     let path = entry.path();
                     let rel_path = path.strip_prefix(base).unwrap_or(path);
                     let rel_name = rel_path.to_string_lossy().replace('\\', "/");
+                    let file_type = entry.file_type();
 
-                    if path.is_dir() {
+                    if file_type.is_dir() {
                         builder.append_dir(&rel_name, path)?;
-                    } else if path.is_file() {
+                    } else if file_type.is_file() {
                         builder.append_path_with_name(path, &rel_name)?;
+                    } else if file_type.is_symlink() {
+                        if path.is_dir() {
+                            builder.append_dir(&rel_name, path)?;
+                        } else if path.is_file() {
+                            builder.append_path_with_name(path, &rel_name)?;
+                        }
                     }
                 }
-            } else if target.is_file() {
-                let file_name = target.file_name().unwrap_or_default().to_string_lossy().to_string();
+            } else if target_meta.is_file() {
+                let file_name = target
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 builder.append_path_with_name(target, &file_name)?;
             }
         }
 
-        builder.finish()?;
+        let mut output = builder.into_inner()?;
+        output.flush()?;
         Ok(())
     }
 }

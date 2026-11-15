@@ -1,5 +1,7 @@
-use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
+use std::path::{Path, PathBuf};
+
+pub(crate) mod io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
@@ -127,10 +129,18 @@ impl Default for ExtractOptions {
 
 pub trait ArchiveReader {
     fn list(&mut self) -> anyhow::Result<Vec<ArchiveEntry>>;
-    fn extract(&mut self, options: &ExtractOptions, filter: Option<&[String]>) -> anyhow::Result<()>;
+    fn extract(
+        &mut self,
+        options: &ExtractOptions,
+        filter: Option<&[String]>,
+    ) -> anyhow::Result<()>;
     fn test(&mut self, password: Option<&str>) -> anyhow::Result<()>;
 }
 
 pub trait ArchiveWriter {
-    fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> anyhow::Result<()>;
+    fn create(
+        archive_path: &Path,
+        files: &[PathBuf],
+        options: &CompressionOptions,
+    ) -> anyhow::Result<()>;
 }

@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 use sevenz_rust2::Archive;
@@ -332,6 +333,59 @@ fn test_7z_compression_options() {
     let _ = fs::remove_file("archive_ultra_solid.7z");
     let _ = fs::remove_file("archive_dict64.7z");
     let _ = fs::remove_file("archive_store.7z");
+}
+
+#[test]
+fn test_tar_roundtrip_formats() {
+    let test_dir = "test_data_tar_roundtrip";
+    fs::create_dir_all(format!("{}/sub", test_dir)).unwrap();
+    fs::write(format!("{}/small.txt", test_dir), "tar small file").unwrap();
+    fs::write(format!("{}/sub/empty.bin", test_dir), b"").unwrap();
+    fs::write(
+        format!("{}/sub/payload.bin", test_dir),
+        vec![0x5A; 32 * 1024],
+    )
+    .unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+
+    for ext in ["tar", "tar.gz", "tar.bz2"] {
+        let archive = format!("archive_roundtrip.{}", ext);
+        let created = Command::new(exe)
+            .args(["a", &archive, test_dir, "-mx=5"])
+            .status()
+            .unwrap();
+        assert!(created.success(), "failed to create {}", archive);
+
+        let tested = Command::new(exe).args(["t", &archive]).status().unwrap();
+        assert!(tested.success(), "failed to test {}", archive);
+
+        let out_dir = format!("out_tar_{}", ext.replace('.', "_"));
+        let extracted = Command::new(exe)
+            .args(["x", &archive, "-o", &out_dir])
+            .status()
+            .unwrap();
+        assert!(extracted.success(), "failed to extract {}", archive);
+
+        let base = PathBuf::from(&out_dir).join(test_dir);
+        assert_eq!(
+            fs::read_to_string(base.join("small.txt")).unwrap(),
+            "tar small file"
+        );
+        assert_eq!(
+            fs::read(base.join("sub/empty.bin")).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            fs::read(base.join("sub/payload.bin")).unwrap(),
+            vec![0x5A; 32 * 1024]
+        );
+
+        let _ = fs::remove_dir_all(&out_dir);
+        let _ = fs::remove_file(&archive);
+    }
+
+    let _ = fs::remove_dir_all(test_dir);
 }
 
 #[test]
