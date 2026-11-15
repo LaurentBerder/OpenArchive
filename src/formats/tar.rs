@@ -7,8 +7,9 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write, copy, sink};
+use std::io::{BufReader, BufWriter, Read, Write, copy, empty, sink};
 use std::path::{Path, PathBuf};
+use tar::Header;
 use walkdir::WalkDir;
 
 use crate::core::io as file_io;
@@ -164,14 +165,16 @@ impl ArchiveWriter for TarHandler {
                     let file_type = entry.file_type();
 
                     if file_type.is_dir() {
-                        builder.append_dir(&rel_name, path)?;
+                        let metadata = entry.metadata()?;
+                        append_tar_dir(&mut builder, &rel_name, &metadata)?;
                     } else if file_type.is_file() {
-                        builder.append_path_with_name(path, &rel_name)?;
+                        append_tar_file(&mut builder, &rel_name, path)?;
                     } else if file_type.is_symlink() {
                         if path.is_dir() {
-                            builder.append_dir(&rel_name, path)?;
+                            let metadata = path.metadata()?;
+                            append_tar_dir(&mut builder, &rel_name, &metadata)?;
                         } else if path.is_file() {
-                            builder.append_path_with_name(path, &rel_name)?;
+                            append_tar_file(&mut builder, &rel_name, path)?;
                         }
                     }
                 }
@@ -181,7 +184,7 @@ impl ArchiveWriter for TarHandler {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                builder.append_path_with_name(target, &file_name)?;
+                append_tar_file(&mut builder, &file_name, target)?;
             }
         }
 
@@ -189,4 +192,36 @@ impl ArchiveWriter for TarHandler {
         output.flush()?;
         Ok(())
     }
+}
+
+fn append_tar_file<W: Write>(builder: &mut tar::Builder<W>, name: &str, path: &Path) -> Result<()> {
+    let file = file_io::open_sequential(path)?;
+    // Read metadata from the opened handle so the header size matches the
+    // bytes about to be copied, even if the file changed after traversal.
+    let metadata = file.metadata()?;
+
+    let mut header = Header::new_gnu();
+    header.set_metadata(&metadata);
+
+    if metadata.len() < file_io::SMALL_FILE_THRESHOLD {
+        builder.append_data(&mut header, name, file)?;
+    } else {
+        let mut reader = BufReader::with_capacity(file_io::IO_BUFFER_SIZE, file);
+        builder.append_data(&mut header, name, &mut reader)?;
+    }
+
+    Ok(())
+}
+
+fn append_tar_dir<W: Write>(
+    builder: &mut tar::Builder<W>,
+    name: &str,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    let mut header = Header::new_gnu();
+    header.set_metadata(metadata);
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_size(0);
+    builder.append_data(&mut header, name, empty())?;
+    Ok(())
 }

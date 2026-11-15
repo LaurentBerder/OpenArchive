@@ -341,9 +341,12 @@ fn test_tar_roundtrip_formats() {
     fs::create_dir_all(format!("{}/sub", test_dir)).unwrap();
     fs::write(format!("{}/small.txt", test_dir), "tar small file").unwrap();
     fs::write(format!("{}/sub/empty.bin", test_dir), b"").unwrap();
+    let payload = vec![0x5A; 256 * 1024];
+    fs::write(format!("{}/sub/payload.bin", test_dir), &payload).unwrap();
+    let long_name = format!("long_{}.txt", "segment_".repeat(20));
     fs::write(
-        format!("{}/sub/payload.bin", test_dir),
-        vec![0x5A; 32 * 1024],
+        format!("{}/sub/{}", test_dir, long_name),
+        "long path payload",
     )
     .unwrap();
 
@@ -376,9 +379,10 @@ fn test_tar_roundtrip_formats() {
             fs::read(base.join("sub/empty.bin")).unwrap(),
             Vec::<u8>::new()
         );
+        assert_eq!(fs::read(base.join("sub/payload.bin")).unwrap(), payload);
         assert_eq!(
-            fs::read(base.join("sub/payload.bin")).unwrap(),
-            vec![0x5A; 32 * 1024]
+            fs::read_to_string(base.join("sub").join(&long_name)).unwrap(),
+            "long path payload"
         );
 
         let _ = fs::remove_dir_all(&out_dir);

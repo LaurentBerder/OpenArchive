@@ -545,7 +545,12 @@ Oversized ZIP batches now spill to unique temporary sub-archives instead of forc
 
 ### 15.4 TAR family
 
-TAR creation still goes through `tar::Builder::append_path_with_name`, which opens and copies files internally instead of using the shared I/O helpers. TAR extraction is sequential by format design. TAR.GZ and TAR.BZ2 compression are single-threaded (`flate2` / `bzip2`); a pigz-style multi-member gzip implementation or a faster backend is a separate project.
+- [x] ~~TAR creation via explicit headers~~ [COMPLETED]: TAR creation no longer calls `tar::Builder::append_path_with_name` or `append_dir`. It builds GNU headers from fresh metadata on the opened file, uses the shared sequential-open path and 256 KB buffered reads for large files, and lets `append_data` handle long names. Directories get explicit `Directory` headers with size 0.
+  - **Validation:** roundtrip tests cover `.tar`, `.tar.gz`, and `.tar.bz2` with empty files, a 256 KB payload, and a long path. All formats pass `7z t`, and `bsdtar -tf` lists the expected entries.
+  - **Benchmark:** on an 879-file / 785 MB tree, TAR creation improved from 13.36 s to 12.94 s (minimum of two runs). A 782-file / 15 MB tree was noise-dominated by Defender and showed no clear win.
+  - **Caveat:** `append_data` does not emit sparse-file headers, so sparse files are stored as regular entries. File contents remain correct; only the on-disk sparse representation is lost.
+- [ ] **TAR extraction** remains sequential by format design.
+- [ ] **TAR.GZ / TAR.BZ2 compression** remains single-threaded (`flate2` / `bzip2`); a pigz-style multi-member gzip implementation or a faster backend is a separate project.
 
 ### 15.5 Deeper Windows I/O
 
