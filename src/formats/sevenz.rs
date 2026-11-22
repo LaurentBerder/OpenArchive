@@ -195,10 +195,8 @@ impl ArchiveReader for SevenZHandler {
 
         for f in reader.archive().files.iter() {
             let name = f.name();
-            if let Some(filters) = filter {
-                if !filters.is_empty() && !filters.iter().any(|fil| name.contains(fil)) {
-                    continue;
-                }
+            if !paths::matches_filter(filter, name) {
+                continue;
             }
 
             // This pass sees every name first, so an unsafe one refuses the
@@ -252,10 +250,8 @@ impl ArchiveReader for SevenZHandler {
             reader.for_each_entries(|entry, stream| {
                 let name = entry.name();
 
-                if let Some(filters) = filter {
-                    if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
-                        return Ok(true);
-                    }
+                if !paths::matches_filter(filter, name) {
+                    return Ok(true);
                 }
 
                 if !entry.is_directory() {
@@ -323,10 +319,8 @@ impl ArchiveReader for SevenZHandler {
                     }
 
                     let name = entry.name();
-                    if let Some(filters) = filter {
-                        if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
-                            return Ok(true);
-                        }
+                    if !paths::matches_filter(filter, name) {
+                        return Ok(true);
                     }
 
                     if !entry.is_directory() {
@@ -511,10 +505,8 @@ fn extract_blocks_parallel(
                         }
 
                         let name = entry.name();
-                        if let Some(filters) = filter {
-                            if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
-                                return Ok(true);
-                            }
+                        if !paths::matches_filter(filter, name) {
+                            return Ok(true);
                         }
 
                         if !entry.is_directory() {

@@ -180,10 +180,8 @@ impl ArchiveReader for ZipHandler {
             let file = archive.by_index_raw(i)?;
             let name = file.name();
 
-            if let Some(filters) = filter {
-                if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
-                    continue;
-                }
+            if !paths::matches_filter(filter, name) {
+                continue;
             }
 
             let Some(target_path) = paths::entry_target(&options.output_dir, name, options.flat)?

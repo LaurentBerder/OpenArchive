@@ -84,10 +84,8 @@ impl TarHandler {
             let entry = entry?;
             let name = entry.path()?.to_string_lossy().to_string();
 
-            if let Some(filters) = filter {
-                if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
-                    continue;
-                }
+            if !paths::matches_filter(filter, &name) {
+                continue;
             }
 
             let Some(target_path) = paths::entry_target(&options.output_dir, &name, false)? else {
@@ -270,10 +268,8 @@ impl ArchiveReader for TarHandler {
             let mut entry = entry?;
             let name = entry.path()?.to_string_lossy().to_string();
 
-            if let Some(filters) = filter {
-                if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
-                    continue;
-                }
+            if !paths::matches_filter(filter, &name) {
+                continue;
             }
 
             let Some(target_path) = paths::entry_target(&options.output_dir, &name, options.flat)?

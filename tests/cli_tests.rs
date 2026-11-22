@@ -1208,3 +1208,89 @@ fn test_rooted_entry_extracts_inside_output_dir() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+// ─── Entry filter regression tests ──────────────────────────────────────────
+
+/// Relative paths of all files under `root`, with `/` separators, sorted.
+fn files_under(root: &str) -> Vec<String> {
+    let mut files: Vec<String> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn test_filter_selects_exact_entries_only() {
+    let dir = "test_filter";
+    let _ = fs::remove_dir_all(dir);
+    let src = format!("{dir}/flt");
+    // Every file contains its own relative path, so collisions are visible.
+    for rel in [
+        "a.txt",
+        "data.txt",
+        "a.txt.bak",
+        "sub/a.txt",
+        "docs/x.txt",
+        "docs/deep/z.txt",
+        "docs2/y.txt",
+    ] {
+        let path = PathBuf::from(&src).join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, rel).unwrap();
+    }
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    for ext in ["zip", "7z", "tar", "tar.gz"] {
+        let archive = format!("{dir}/filter.{ext}");
+        let status = Command::new(exe)
+            .current_dir(dir)
+            .args(["a", &format!("filter.{ext}"), "flt"])
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "creating {archive}");
+
+        for threads in ["-mmt=1", "-mmt=4"] {
+            // Full-path extraction: one file and one directory.
+            let out = format!("{dir}/out_{ext}_{threads}");
+            let _ = fs::remove_dir_all(&out);
+            let status = Command::new(exe)
+                .args(["x", &archive, "flt/a.txt", "flt/docs", "-o", &out, threads])
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "extracting {archive} {threads}");
+            assert_eq!(
+                files_under(&out),
+                ["flt/a.txt", "flt/docs/deep/z.txt", "flt/docs/x.txt"],
+                "{archive} {threads}"
+            );
+
+            // Flat extraction of a single file must not pull in
+            // `sub/a.txt`, `data.txt` or `a.txt.bak`.
+            let flat = format!("{dir}/flat_{ext}_{threads}");
+            let _ = fs::remove_dir_all(&flat);
+            let status = Command::new(exe)
+                .args(["e", &archive, "flt/a.txt", "-o", &flat, threads])
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "flat extracting {archive} {threads}");
+            assert_eq!(files_under(&flat), ["a.txt"], "{archive} {threads}");
+            assert_eq!(fs::read_to_string(format!("{flat}/a.txt")).unwrap(), "a.txt");
+        }
+    }
+
+    let _ = fs::remove_dir_all(dir);
+}

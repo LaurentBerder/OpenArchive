@@ -64,6 +64,54 @@ pub(crate) fn entry_target(output_dir: &Path, name: &str, flat: bool) -> io::Res
     Ok(Some(output_dir.join(relative)))
 }
 
+/// Returns whether an archive entry is selected by the user's filters.
+///
+/// A filter selects the entry with exactly that path, and everything below it
+/// when it names a directory: `docs` selects `docs`, `docs/` and `docs/a.txt`,
+/// but not `docs2/a.txt` or `old/docs`. `/` and `\` are equivalent, and
+/// leading `./` or `/` and trailing separators are ignored on both sides.
+/// Matching is case-sensitive. No filters (or an empty list) selects
+/// everything, as does a filter naming the root (`.` or `/`).
+pub(crate) fn matches_filter(filter: Option<&[String]>, name: &str) -> bool {
+    let Some(filters) = filter else {
+        return true;
+    };
+    if filters.is_empty() {
+        return true;
+    }
+
+    let name = trim_path(name).as_bytes();
+    filters.iter().any(|filter| {
+        let filter = trim_path(filter).as_bytes();
+        if filter.is_empty() {
+            return true;
+        }
+        name.len() >= filter.len()
+            && name
+                .iter()
+                .zip(filter)
+                .all(|(&a, &b)| a == b || (is_separator(a) && is_separator(b)))
+            && (name.len() == filter.len() || is_separator(name[filter.len()]))
+    })
+}
+
+fn is_separator(byte: u8) -> bool {
+    byte == b'/' || byte == b'\\'
+}
+
+/// Strips leading `./` and separators and trailing separators.
+fn trim_path(path: &str) -> &str {
+    let mut path = path;
+    loop {
+        path = path.trim_start_matches(['/', '\\']);
+        match path.strip_prefix('.') {
+            Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => path = rest,
+            _ => break,
+        }
+    }
+    path.trim_end_matches(['/', '\\'])
+}
+
 fn unsafe_entry(name: &str, reason: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -128,6 +176,53 @@ mod tests {
         for name in ["C:\\Windows\\x", "C:x", "C:/x", "file.txt:stream", "\\\\?\\C:\\x"] {
             assert!(sanitize_entry_name(name).is_err(), "{name:?} should be rejected");
         }
+    }
+
+    fn selects(filters: &[&str], name: &str) -> bool {
+        let filters: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
+        matches_filter(Some(&filters), name)
+    }
+
+    #[test]
+    fn filter_matches_exact_paths_only() {
+        assert!(selects(&["a.txt"], "a.txt"));
+        assert!(!selects(&["a.txt"], "data.txt"));
+        assert!(!selects(&["a.txt"], "a.txt.bak"));
+        assert!(!selects(&["a.txt"], "dir/a.txt"));
+        assert!(!selects(&["dir/a.txt"], "a.txt"));
+        assert!(!selects(&["A.txt"], "a.txt"));
+    }
+
+    #[test]
+    fn filter_selects_directory_contents() {
+        assert!(selects(&["docs"], "docs"));
+        assert!(selects(&["docs"], "docs/"));
+        assert!(selects(&["docs"], "docs/a.txt"));
+        assert!(selects(&["docs/"], "docs/sub/b.txt"));
+        assert!(!selects(&["docs"], "docs2/a.txt"));
+        assert!(!selects(&["docs"], "old/docs/a.txt"));
+        assert!(!selects(&["docs/sub"], "docs/a.txt"));
+    }
+
+    #[test]
+    fn filter_normalizes_separators_and_prefixes() {
+        assert!(selects(&["docs\\a.txt"], "docs/a.txt"));
+        assert!(selects(&["docs/a.txt"], "docs\\a.txt"));
+        assert!(selects(&["./docs/a.txt"], "docs/a.txt"));
+        assert!(selects(&["docs/a.txt"], "./docs/a.txt"));
+        assert!(selects(&["/docs"], "docs/a.txt"));
+        assert!(selects(&[".hidden"], ".hidden"));
+        assert!(!selects(&[".hidden"], "hidden"));
+    }
+
+    #[test]
+    fn filter_any_of_several_and_empty_cases() {
+        assert!(selects(&["x", "docs"], "docs/a.txt"));
+        assert!(!selects(&["x", "y"], "docs/a.txt"));
+        assert!(matches_filter(None, "anything"));
+        assert!(matches_filter(Some(&[]), "anything"));
+        assert!(selects(&["."], "docs/a.txt"));
+        assert!(selects(&["/"], "docs/a.txt"));
     }
 
     #[test]
