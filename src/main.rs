@@ -172,6 +172,7 @@ fn main() -> Result<()> {
                 password: args.password,
                 overwrite: true,
                 threads: args.threads,
+                progress: None,
             };
 
             if let Some(th) = extract_opts.threads {
@@ -189,7 +190,7 @@ fn main() -> Result<()> {
             println!("Testing archive: {}\n", args.archive.display());
 
             let mut reader = get_reader(&args.archive, args.password.clone())?;
-            reader.test(args.password.as_deref())?;
+            reader.test(args.password.as_deref(), None)?;
 
             println!("\nTesting completed in {:.2?}", start_time.elapsed());
             println!("Everything is Ok");

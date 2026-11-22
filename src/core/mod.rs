@@ -1,8 +1,12 @@
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub(crate) mod io;
 pub(crate) mod paths;
+pub mod progress;
+
+pub use progress::{Cancelled, Progress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
@@ -114,6 +118,9 @@ pub struct ExtractOptions {
     pub password: Option<String>,
     pub overwrite: bool,
     pub threads: Option<usize>,
+    /// Reports bytes written and lets the caller cancel. On cancellation the
+    /// file being written is removed and extraction fails with [`Cancelled`].
+    pub progress: Option<Arc<Progress>>,
 }
 
 impl Default for ExtractOptions {
@@ -124,6 +131,7 @@ impl Default for ExtractOptions {
             password: None,
             overwrite: true,
             threads: None,
+            progress: None,
         }
     }
 }
@@ -135,7 +143,9 @@ pub trait ArchiveReader {
         options: &ExtractOptions,
         filter: Option<&[String]>,
     ) -> anyhow::Result<()>;
-    fn test(&mut self, password: Option<&str>) -> anyhow::Result<()>;
+    /// Decompresses every entry and verifies it. `progress`, if given,
+    /// receives the bytes verified and can cancel the test.
+    fn test(&mut self, password: Option<&str>, progress: Option<&Progress>) -> anyhow::Result<()>;
 }
 
 pub trait ArchiveWriter {

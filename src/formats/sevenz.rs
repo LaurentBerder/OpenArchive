@@ -7,7 +7,7 @@ use sevenz_rust2::{
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Seek, Write, copy};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 
 use crate::core::io as file_io;
 use crate::core::paths;
-use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
+use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions, Progress};
 
 const MB: u64 = 1024 * 1024;
 
@@ -192,6 +192,7 @@ impl ArchiveReader for SevenZHandler {
         // 1. Directory pre-creation up front: avoid per-file filesystem collision & overhead
         let mut dir_set: HashSet<PathBuf> = HashSet::new();
         dir_set.insert(options.output_dir.clone());
+        let mut total_bytes = 0u64;
 
         for f in reader.archive().files.iter() {
             let name = f.name();
@@ -210,11 +211,18 @@ impl ArchiveReader for SevenZHandler {
                 if !options.flat {
                     dir_set.insert(target_path);
                 }
-            } else if let Some(parent) = target_path.parent() {
-                if !dir_set.contains(parent) {
-                    dir_set.insert(parent.to_path_buf());
+            } else {
+                total_bytes = total_bytes.saturating_add(f.size());
+                if let Some(parent) = target_path.parent() {
+                    if !dir_set.contains(parent) {
+                        dir_set.insert(parent.to_path_buf());
+                    }
                 }
             }
+        }
+
+        if let Some(progress) = &options.progress {
+            progress.set_total(total_bytes);
         }
 
         for dir in &dir_set {
@@ -261,7 +269,7 @@ impl ArchiveReader for SevenZHandler {
                         return Ok(true);
                     };
 
-                    file_io::copy_to_file(stream, &target_path, entry.size())?;
+                    file_io::copy_to_file(stream, &target_path, entry.size(), options.progress.as_deref())?;
                 }
 
                 Ok(true)
@@ -295,7 +303,7 @@ impl ArchiveReader for SevenZHandler {
                             };
 
                             let res: Result<()> =
-                                file_io::write_buffer(&target_path, &data).map_err(Into::into);
+                                file_io::write_buffer(&target_path, &data, options.progress.as_deref()).map_err(Into::into);
 
                             if let Err(e) = res {
                                 {
@@ -364,7 +372,7 @@ impl ArchiveReader for SevenZHandler {
                         } else {
                             // Large files streamed directly; small ones were
                             // handled by the bounded pipeline above.
-                            file_io::copy_to_file(stream, &target_path, entry.size())?;
+                            file_io::copy_to_file(stream, &target_path, entry.size(), options.progress.as_deref())?;
                         }
                     }
 
@@ -389,7 +397,7 @@ impl ArchiveReader for SevenZHandler {
         Ok(())
     }
 
-    fn test(&mut self, password: Option<&str>) -> Result<()> {
+    fn test(&mut self, password: Option<&str>, progress: Option<&Progress>) -> Result<()> {
         let pass = password
             .or(self.password.as_deref())
             .map(Password::from)
@@ -398,9 +406,12 @@ impl ArchiveReader for SevenZHandler {
         let mut reader = SzReader::open(&self.path, pass)
             .with_context(|| format!("Failed to open 7z archive: {}", self.path.display()))?;
 
-        let mut sink = io::sink();
+        if let Some(progress) = progress {
+            let total = reader.archive().files.iter().fold(0u64, |acc, f| acc.saturating_add(f.size()));
+            progress.set_total(total);
+        }
         reader.for_each_entries(|_entry, stream| {
-            copy(stream, &mut sink)?;
+            file_io::drain(stream, progress)?;
             Ok(true)
         })?;
 
@@ -449,7 +460,7 @@ fn extract_blocks_parallel(
 
                     let result = {
                         let _guard = write_lock.lock().unwrap();
-                        file_io::write_buffer(&target_path, &data)
+                        file_io::write_buffer(&target_path, &data, options.progress.as_deref())
                     };
                     budget.release(reserved);
 
@@ -540,7 +551,7 @@ fn extract_blocks_parallel(
                                 if first_err.lock().unwrap().is_some() {
                                     return Ok(false);
                                 }
-                                file_io::copy_to_file(stream, &target_path, entry.size())?;
+                                file_io::copy_to_file(stream, &target_path, entry.size(), options.progress.as_deref())?;
                             }
                         }
 

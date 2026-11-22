@@ -7,7 +7,7 @@ use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, copy, empty, sink};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, empty};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +18,7 @@ use super::stream_compress::{self, Codec, ParallelCompressor};
 use crate::core::io as file_io;
 use crate::core::paths;
 use crate::core::{
-    ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions,
+    ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions, Progress,
 };
 
 struct TarIndexItem {
@@ -125,6 +125,11 @@ impl TarHandler {
             .iter()
             .fold(0u64, |acc, item| acc.saturating_add(item.size));
         let average_size = total_size / files.len() as u64;
+        // Only the indexed (parallel) path knows the total up front; streamed
+        // TAR reports bytes without a percentage.
+        if let Some(progress) = &options.progress {
+            progress.set_total(total_size);
+        }
 
         for dir in &dirs {
             fs::create_dir_all(dir)?;
@@ -138,7 +143,7 @@ impl TarHandler {
             for item in &files {
                 source.seek(SeekFrom::Start(item.offset))?;
                 let mut reader = Read::by_ref(&mut source).take(item.size);
-                file_io::copy_to_file(&mut reader, &item.target, item.size)?;
+                file_io::copy_to_file(&mut reader, &item.target, item.size, options.progress.as_deref())?;
             }
             return Ok(true);
         }
@@ -187,7 +192,7 @@ impl TarHandler {
                                 None
                             };
                             let mut reader = Read::by_ref(&mut source).take(item.size);
-                            file_io::copy_to_file(&mut reader, &item.target, item.size)?;
+                            file_io::copy_to_file(&mut reader, &item.target, item.size, options.progress.as_deref())?;
                             Ok(())
                         })();
 
@@ -289,21 +294,21 @@ impl ArchiveReader for TarHandler {
                     }
                 }
                 let size = entry.size();
-                file_io::copy_to_file(&mut entry, &target_path, size)?;
+                file_io::copy_to_file(&mut entry, &target_path, size, options.progress.as_deref())?;
             }
         }
 
         Ok(())
     }
 
-    fn test(&mut self, _password: Option<&str>) -> Result<()> {
+    fn test(&mut self, _password: Option<&str>, progress: Option<&Progress>) -> Result<()> {
         let reader = self.open_reader()?;
         let mut archive = tar::Archive::new(reader);
 
-        let mut out = sink();
+        // Streamed: the total is unknown, so only bytes are reported.
         for entry in archive.entries()? {
             let mut entry = entry?;
-            copy(&mut entry, &mut out)?;
+            file_io::drain(&mut entry, progress)?;
         }
 
         Ok(())

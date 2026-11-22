@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Cursor, ErrorKind, Seek, Write, copy, sink};
+use std::io::{self, BufWriter, Cursor, ErrorKind, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
@@ -11,7 +11,7 @@ use zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::core::io as file_io;
 use crate::core::paths;
-use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
+use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions, Progress};
 
 /// Target uncompressed size of one parallel ZIP batch. The compressed batch is
 /// held in memory until it is merged, so this value directly bounds per-worker
@@ -204,6 +204,11 @@ impl ArchiveReader for ZipHandler {
             }
         }
 
+        if let Some(progress) = &options.progress {
+            let total = files_to_extract.iter().fold(0u64, |acc, (_, _, size)| acc.saturating_add(*size));
+            progress.set_total(total);
+        }
+
         // 2. Pre-create all directories up front sequentially
         for dir in &dirs_to_create {
             fs::create_dir_all(dir)?;
@@ -233,7 +238,7 @@ impl ArchiveReader for ZipHandler {
                 } else {
                     archive.by_index(i)?
                 };
-                file_io::copy_to_file(&mut file, &target_path, size)?;
+                file_io::copy_to_file(&mut file, &target_path, size, options.progress.as_deref())?;
             }
         } else {
             // Parallel extraction: each worker thread has an independent archive handle
@@ -283,7 +288,7 @@ impl ArchiveReader for ZipHandler {
                                 } else {
                                     arch.by_index(entry_idx)?
                                 };
-                                file_io::copy_to_file(&mut file, target_path, size)?;
+                                file_io::copy_to_file(&mut file, target_path, size, options.progress.as_deref())?;
                                 Ok(())
                             })();
 
@@ -307,21 +312,27 @@ impl ArchiveReader for ZipHandler {
         Ok(())
     }
 
-    fn test(&mut self, password: Option<&str>) -> Result<()> {
+    fn test(&mut self, password: Option<&str>, progress: Option<&Progress>) -> Result<()> {
         let file = File::open(&self.path)
             .with_context(|| format!("Failed to open zip archive: {}", self.path.display()))?;
         let mut archive = ZipArchive::new(file)?;
 
         let pass = password.or(self.password.as_deref());
 
-        let mut out = sink();
+        if let Some(progress) = progress {
+            let mut total = 0u64;
+            for i in 0..archive.len() {
+                total = total.saturating_add(archive.by_index_raw(i)?.size());
+            }
+            progress.set_total(total);
+        }
         for i in 0..archive.len() {
             let mut file = if let Some(p) = pass {
                 archive.by_index_decrypt(i, p.as_bytes())?
             } else {
                 archive.by_index(i)?
             };
-            copy(&mut file, &mut out)?;
+            file_io::drain(&mut file, progress)?;
         }
 
         Ok(())
