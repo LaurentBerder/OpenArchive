@@ -101,7 +101,7 @@ fn main() -> Result<()> {
             print_banner();
             println!("Listing archive: {}\n", args.archive.display());
 
-            let format = ArchiveFormat::from_path(&args.archive)
+            let format = ArchiveFormat::detect(&args.archive)
                 .unwrap_or(ArchiveFormat::SevenZip);
 
             let meta = fs::metadata(&args.archive)?;

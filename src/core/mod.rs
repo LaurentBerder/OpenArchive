@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod detect;
 pub(crate) mod io;
 pub(crate) mod paths;
 pub mod progress;
@@ -42,31 +43,19 @@ impl ArchiveFormat {
             return Some(Self::Tar);
         }
 
-        // Try detecting by magic bytes if file exists
-        if let Ok(mut file) = std::fs::File::open(path) {
-            use std::io::Read;
-            let mut magic = [0u8; 6];
-            if file.read_exact(&mut magic).is_ok() {
-                // 7z: 37 7A BC AF 27 1C
-                if &magic == &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C] {
-                    return Some(Self::SevenZip);
-                }
-                // Zip: 50 4B 03 04 or 50 4B 05 06
-                if &magic[0..2] == &[0x50, 0x4B] {
-                    return Some(Self::Zip);
-                }
-                // Gz: 1F 8B
-                if &magic[0..2] == &[0x1F, 0x8B] {
-                    return Some(Self::TarGz);
-                }
-                // Bz2: 42 5A
-                if &magic[0..2] == &[0x42, 0x5A] {
-                    return Some(Self::TarBz2);
-                }
-            }
-        }
+        // No known extension: look at the content, if the file exists.
+        detect::detect_content(path)
+    }
 
-        None
+    /// The format of an existing archive, for opening it: its content first
+    /// (7-Zip does the same, so a 7z named `.zip` still opens), then its name.
+    ///
+    /// Use [`Self::from_path`] to choose the format of an archive being
+    /// created: there the name decides, even if an older file of another
+    /// format is in the way.
+    pub fn detect<P: AsRef<Path>>(path: P) -> Option<Self> {
+        let path = path.as_ref();
+        detect::detect_content(path).or_else(|| Self::from_path(path))
     }
 
     pub fn display_name(&self) -> &'static str {

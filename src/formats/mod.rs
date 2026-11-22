@@ -13,7 +13,7 @@ use self::tar::TarHandler;
 
 pub fn get_reader<P: AsRef<Path>>(path: P, password: Option<String>) -> Result<Box<dyn ArchiveReader>> {
     let p = path.as_ref();
-    let format = ArchiveFormat::from_path(p)
+    let format = ArchiveFormat::detect(p)
         .ok_or_else(|| anyhow::anyhow!("Unknown or unsupported archive format for: {}", p.display()))?;
 
     match format {

@@ -1501,3 +1501,30 @@ fn test_tar_xz_roundtrip_single_and_multithreaded() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_misnamed_archive_is_opened_by_content() {
+    let dir = PathBuf::from("test_misnamed_archive");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/a.txt"), b"by content").unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    let created = Command::new(exe).current_dir(&dir).args(["a", "real.7z", "src"]).output().unwrap();
+    assert!(created.status.success());
+    fs::rename(dir.join("real.7z"), dir.join("misnamed.zip")).unwrap();
+
+    let listed = Command::new(exe).args(["l", dir.join("misnamed.zip").to_str().unwrap()]).output().unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("Type = 7z"));
+
+    let out = dir.join("out");
+    let extracted = Command::new(exe)
+        .args(["x", dir.join("misnamed.zip").to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(extracted.status.success(), "{}", String::from_utf8_lossy(&extracted.stderr));
+    assert_eq!(fs::read(out.join("src/a.txt")).unwrap(), b"by content");
+
+    let _ = fs::remove_dir_all(&dir);
+}
