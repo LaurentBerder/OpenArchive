@@ -212,7 +212,9 @@ impl ArchiveReader for SevenZHandler {
                     dir_set.insert(target_path);
                 }
             } else if let Some(parent) = target_path.parent() {
-                dir_set.insert(parent.to_path_buf());
+                if !dir_set.contains(parent) {
+                    dir_set.insert(parent.to_path_buf());
+                }
             }
         }
 

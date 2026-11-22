@@ -96,7 +96,9 @@ impl TarHandler {
                 dirs.insert(target_path);
             } else if entry_type.is_file() {
                 if let Some(parent) = target_path.parent() {
-                    dirs.insert(parent.to_path_buf());
+                    if !dirs.contains(parent) {
+                        dirs.insert(parent.to_path_buf());
+                    }
                 }
                 if !targets.insert(target_path.clone()) {
                     return Ok(false);
@@ -284,8 +286,9 @@ impl ArchiveReader for TarHandler {
                 }
             } else {
                 if let Some(parent) = target_path.parent() {
-                    if known_dirs.insert(parent.to_path_buf()) {
+                    if !known_dirs.contains(parent) {
                         fs::create_dir_all(parent)?;
+                        known_dirs.insert(parent.to_path_buf());
                     }
                 }
                 let size = entry.size();
