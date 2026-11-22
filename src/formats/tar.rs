@@ -89,7 +89,10 @@ impl TarHandler {
                 }
             }
 
-            let target_path = options.output_dir.join(&name);
+            let Some(target_path) = file_io::entry_target(&options.output_dir, &name, false) else {
+                file_io::warn_unsafe_entry(&name);
+                continue;
+            };
             let entry_type = entry.header().entry_type();
 
             if entry_type.is_dir() {
@@ -273,11 +276,10 @@ impl ArchiveReader for TarHandler {
                 }
             }
 
-            let target_path = if options.flat {
-                let file_name = Path::new(&name).file_name().unwrap_or_default();
-                options.output_dir.join(file_name)
-            } else {
-                options.output_dir.join(&name)
+            let Some(target_path) = file_io::entry_target(&options.output_dir, &name, options.flat)
+            else {
+                file_io::warn_unsafe_entry(&name);
+                continue;
             };
 
             if entry.header().entry_type().is_dir() {

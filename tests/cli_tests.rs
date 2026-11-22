@@ -462,6 +462,131 @@ fn test_tar_reads_multi_member_streams() {
     }
 }
 
+/// TAR with a raw entry name: `tar::Builder::append_data` refuses `..`, so
+/// the header name bytes are written directly.
+fn tar_with_raw_names(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, data) in entries {
+        let mut header = tar::Header::new_gnu();
+        let name_field = &mut header.as_old_mut().name;
+        assert!(name.len() < name_field.len());
+        name_field[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder.append(&header, *data).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+#[test]
+fn test_extraction_rejects_path_traversal() {
+    use std::io::Write;
+
+    let sandbox = PathBuf::from("slip_sandbox");
+    let _ = fs::remove_dir_all(&sandbox);
+    fs::create_dir_all(&sandbox).unwrap();
+    let out_dir = sandbox.join("out");
+    // An absolute name that, if honoured, lands inside the sandbox rather
+    // than somewhere unexpected on the machine.
+    let absolute = fs::canonicalize(&sandbox)
+        .unwrap()
+        .join("abs_escape.txt")
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    let check = |archive: &PathBuf, extra_args: &[&str], label: &str| {
+        let _ = fs::remove_dir_all(&out_dir);
+        let mut args = vec![
+            "x".to_string(),
+            archive.to_string_lossy().to_string(),
+            "-o".to_string(),
+            out_dir.to_string_lossy().to_string(),
+        ];
+        args.extend(extra_args.iter().map(|s| s.to_string()));
+        let output = Command::new(exe).args(&args).output().unwrap();
+        assert!(output.status.success(), "{label}: extraction failed");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("outside the output directory"),
+            "{label}: expected a warning"
+        );
+        assert_eq!(
+            fs::read_to_string(out_dir.join("safe").join("ok.txt")).unwrap(),
+            "safe",
+            "{label}: safe entry must still be extracted"
+        );
+        for escaped in ["escape.txt", "escape2.txt", "abs_escape.txt"] {
+            assert!(
+                !sandbox.join(escaped).exists(),
+                "{label}: {escaped} escaped the output directory"
+            );
+        }
+    };
+
+    // TAR / TAR.GZ: plain TAR takes the parallel indexed path with threads
+    // and the sequential path with -mmt=1; TAR.GZ is always sequential.
+    let tar_bytes = tar_with_raw_names(&[
+        ("safe/ok.txt", b"safe"),
+        ("../escape.txt", b"evil"),
+        ("safe/../../escape2.txt", b"evil"),
+    ]);
+    let tar_path = sandbox.join("slip.tar");
+    fs::write(&tar_path, &tar_bytes).unwrap();
+    check(&tar_path, &["-mmt=4"], "tar parallel");
+    check(&tar_path, &["-mmt=1"], "tar sequential");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+    gz.write_all(&tar_bytes).unwrap();
+    let tgz_path = sandbox.join("slip.tar.gz");
+    fs::write(&tgz_path, gz.finish().unwrap()).unwrap();
+    check(&tgz_path, &[], "tar.gz");
+
+    // ZIP, including an absolute name.
+    let zip_path = sandbox.join("slip.zip");
+    {
+        let mut zip = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, data) in [
+            ("safe/ok.txt", "safe"),
+            ("../escape.txt", "evil"),
+            ("safe/../../escape2.txt", "evil"),
+            (absolute.as_str(), "evil"),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(data.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    check(&zip_path, &["-mmt=4"], "zip parallel");
+    check(&zip_path, &["-mmt=1"], "zip sequential");
+
+    // 7z, sequential and pipelined extraction.
+    let sz_path = sandbox.join("slip.7z");
+    {
+        let mut writer = sevenz_rust2::ArchiveWriter::create(&sz_path).unwrap();
+        for (name, data) in [
+            ("safe/ok.txt", "safe"),
+            ("../escape.txt", "evil"),
+            ("safe/../../escape2.txt", "evil"),
+            (absolute.as_str(), "evil"),
+        ] {
+            writer
+                .push_archive_entry(
+                    sevenz_rust2::ArchiveEntry::new_file(name),
+                    Some(data.as_bytes()),
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    check(&sz_path, &["-mmt=4"], "7z pipelined");
+    check(&sz_path, &["-mmt=1"], "7z sequential");
+
+    let _ = fs::remove_dir_all(&sandbox);
+}
+
 /// Decode a compressed TAR with the standard decoder crates (no OpenArchive
 /// code involved) and return (path, contents) for each regular file.
 fn decode_tar_with_std_crates(path: &str) -> Vec<(String, Vec<u8>)> {

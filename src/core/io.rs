@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// Buffer size for large sequential reads and writes. Large enough to keep
 /// syscall overhead low without making per-worker memory noticeable.
@@ -98,6 +98,44 @@ pub(crate) fn copy_to_file<R: Read + ?Sized>(
 pub(crate) fn write_buffer(path: &Path, data: &[u8]) -> io::Result<()> {
     let mut file = File::create(path)?;
     file.write_all(data)
+}
+
+/// Resolve an archive entry name to its extraction path under `output_dir`.
+///
+/// Returns `None` for names that would escape the output directory ("zip
+/// slip" / "tar slip"): absolute paths, Windows drive or UNC prefixes, a
+/// leading root, or any `..` component. `.` components are dropped. With
+/// `flat`, only the final name component is used. Callers skip such entries
+/// and report them once with [`warn_unsafe_entry`].
+pub(crate) fn entry_target(output_dir: &Path, name: &str, flat: bool) -> Option<PathBuf> {
+    // Archives written on Windows may use '\' even where the host does not
+    // treat it as a separator; normalize so `..\x` is caught everywhere.
+    let normalized;
+    let name = if name.contains('\\') {
+        normalized = name.replace('\\', "/");
+        normalized.as_str()
+    } else {
+        name
+    };
+
+    let mut relative = PathBuf::new();
+    for component in Path::new(name).components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    if flat {
+        let file_name = relative.file_name()?;
+        return Some(output_dir.join(file_name));
+    }
+    Some(output_dir.join(relative))
+}
+
+pub(crate) fn warn_unsafe_entry(name: &str) {
+    eprintln!("Warning: skipping entry outside the output directory: {name}");
 }
 
 /// Size of each block handed from a read-ahead thread to its consumer.
@@ -197,6 +235,56 @@ impl Read for ReadAhead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_target_rejects_escaping_names() {
+        let out = Path::new("out");
+        for name in [
+            "../escape.txt",
+            "a/../../escape.txt",
+            "a/..",
+            "..\\escape.txt",
+            "a\\..\\..\\escape.txt",
+            "/etc/passwd",
+            "\\abs.txt",
+            "C:\\Windows\\evil.dll",
+            "C:/evil.txt",
+            "C:evil.txt",
+            "\\\\server\\share\\evil.txt",
+        ] {
+            // Drive letters are prefixes only on Windows; elsewhere `C:` is an
+            // ordinary (odd) directory name that stays inside `out`.
+            if name.starts_with("C:") && !cfg!(windows) {
+                continue;
+            }
+            assert_eq!(entry_target(out, name, false), None, "{name}");
+            if name.ends_with("..") {
+                assert_eq!(entry_target(out, name, true), None, "{name} (flat)");
+            }
+        }
+        // Flat extraction never escapes either, but unsafe names are still
+        // rejected rather than silently renamed.
+        assert_eq!(entry_target(out, "../escape.txt", true), None);
+    }
+
+    #[test]
+    fn entry_target_accepts_normal_names() {
+        let out = Path::new("out");
+        assert_eq!(
+            entry_target(out, "dir/sub/file.txt", false),
+            Some(out.join("dir").join("sub").join("file.txt"))
+        );
+        assert_eq!(
+            entry_target(out, "./dir\\file.txt", false),
+            Some(out.join("dir").join("file.txt"))
+        );
+        assert_eq!(entry_target(out, "dir/", false), Some(out.join("dir")));
+        assert_eq!(
+            entry_target(out, "dir/sub/file.txt", true),
+            Some(out.join("file.txt"))
+        );
+        assert_eq!(entry_target(out, "a..b/c..", false), Some(out.join("a..b").join("c..")));
+    }
 
     #[test]
     fn read_ahead_preserves_stream() {
