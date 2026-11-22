@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use bzip2::Compression as BzCompression;
-use bzip2::read::BzDecoder;
+use bzip2::read::MultiBzDecoder;
 use bzip2::write::BzEncoder;
 use flate2::Compression as GzCompression;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -48,8 +48,8 @@ impl TarHandler {
         let buf_file = BufReader::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
         match self.format {
             ArchiveFormat::Tar => Ok(Box::new(buf_file)),
-            ArchiveFormat::TarGz => Ok(Box::new(GzDecoder::new(buf_file))),
-            ArchiveFormat::TarBz2 => Ok(Box::new(BzDecoder::new(buf_file))),
+            ArchiveFormat::TarGz => Ok(Box::new(MultiGzDecoder::new(buf_file))),
+            ArchiveFormat::TarBz2 => Ok(Box::new(MultiBzDecoder::new(buf_file))),
             _ => anyhow::bail!("Unsupported tar format variant"),
         }
     }

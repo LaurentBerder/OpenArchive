@@ -392,6 +392,76 @@ fn test_tar_roundtrip_formats() {
     let _ = fs::remove_dir_all(test_dir);
 }
 
+/// Build an in-memory TAR with a few entries whose combined data spans
+/// several 512-byte records, so a split lands mid-entry.
+fn sample_tar_bytes(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, data) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, &data[..]).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+#[test]
+fn test_tar_reads_multi_member_streams() {
+    use std::io::Write;
+
+    // pigz/pbzip2-style output: the stream is split into independent gzip
+    // members / bzip2 streams and concatenated. Decoders must read past the
+    // first member instead of stopping (or reporting a truncated archive).
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("multi/a.txt", b"first entry".to_vec()),
+        ("multi/b.bin", (0..200_000u32).map(|i| (i % 251) as u8).collect()),
+        ("multi/c.txt", b"last entry".to_vec()),
+    ];
+    let tar_bytes = sample_tar_bytes(&entries);
+    let parts: Vec<&[u8]> = tar_bytes.chunks(tar_bytes.len() / 3 + 1).collect();
+    assert!(parts.len() >= 3);
+
+    let mut gz = Vec::new();
+    let mut bz = Vec::new();
+    for part in &parts {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        enc.write_all(part).unwrap();
+        gz.extend(enc.finish().unwrap());
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(9));
+        enc.write_all(part).unwrap();
+        bz.extend(enc.finish().unwrap());
+    }
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    for (ext, data) in [("tar.gz", gz), ("tar.bz2", bz)] {
+        let archive = format!("archive_multi_member.{}", ext);
+        fs::write(&archive, data).unwrap();
+
+        let tested = Command::new(exe).args(["t", &archive]).status().unwrap();
+        assert!(tested.success(), "failed to test {}", archive);
+
+        let out_dir = format!("out_multi_member_{}", ext.replace('.', "_"));
+        let extracted = Command::new(exe)
+            .args(["x", &archive, "-o", &out_dir])
+            .status()
+            .unwrap();
+        assert!(extracted.success(), "failed to extract {}", archive);
+        for (name, data) in &entries {
+            assert_eq!(
+                &fs::read(PathBuf::from(&out_dir).join(name)).unwrap(),
+                data,
+                "{} mismatch in {}",
+                name,
+                archive
+            );
+        }
+
+        let _ = fs::remove_dir_all(&out_dir);
+        let _ = fs::remove_file(&archive);
+    }
+}
+
 #[test]
 fn test_tar_large_entries_use_sequential_path() {
     let test_dir = "test_data_tar_large_entries";
