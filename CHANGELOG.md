@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The GUI opens files through the Windows shell API instead of `cmd /c start`, so a file name containing `&` can no longer run commands.
 
 ### Fixed
+- CLI: a missing or wrong password is reported as "Password required: use -p{password}" or "Wrong password" instead of the library's internal error (`PasswordRequired`, `MaybeBadPassword(...)`). Fatal errors exit with code 2, like 7-Zip, and paths in messages use `\` consistently on Windows.
 - Extracting an encrypted 7z where a file cannot be written (full disk, permissions) reports the write error instead of asking for the password again.
 - Existing files are no longer replaced silently on extraction, and `-y` now has an effect.
 - File-name filters on extraction match exact paths (and folder contents) instead of any name containing the text.
