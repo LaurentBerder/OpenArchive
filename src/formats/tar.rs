@@ -4,21 +4,23 @@ use bzip2::read::MultiBzDecoder;
 use bzip2::write::BzEncoder;
 use flate2::Compression as GzCompression;
 use flate2::read::MultiGzDecoder;
+use lzma_rust2::{DICT_SIZE_MAX, DICT_SIZE_MIN, XzOptions, XzReader, XzWriter, XzWriterMt};
 use flate2::write::GzEncoder;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, copy, empty, sink};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, empty};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tar::Header;
+use tar::{EntryType, Header};
 use walkdir::WalkDir;
 
 use super::stream_compress::{self, Codec, ParallelCompressor};
 use crate::core::io as file_io;
 use crate::core::paths;
 use crate::core::{
-    ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions,
+    ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions, Progress,
 };
 
 struct TarIndexItem {
@@ -52,6 +54,8 @@ impl TarHandler {
             ArchiveFormat::Tar => Ok(Box::new(buf_file)),
             ArchiveFormat::TarGz => Ok(Box::new(MultiGzDecoder::new(buf_file))),
             ArchiveFormat::TarBz2 => Ok(Box::new(MultiBzDecoder::new(buf_file))),
+            // `true`: like gzip/bzip2 above, read concatenated streams.
+            ArchiveFormat::TarXz => Ok(Box::new(XzReader::new(buf_file, true))),
             _ => anyhow::bail!("Unsupported tar format variant"),
         }
     }
@@ -82,6 +86,15 @@ impl TarHandler {
 
         for entry in archive.entries_with_seek()? {
             let entry = entry?;
+            let entry_type = entry.header().entry_type();
+            // Metadata records (e.g. git's `pax_global_header`) are not files
+            // and need not force the sequential path.
+            if matches!(
+                entry_type,
+                EntryType::XGlobalHeader | EntryType::XHeader | EntryType::GNULongName | EntryType::GNULongLink
+            ) {
+                continue;
+            }
             let name = entry.path()?.to_string_lossy().to_string();
 
             if !paths::matches_filter(filter, &name) {
@@ -91,7 +104,6 @@ impl TarHandler {
             let Some(target_path) = paths::entry_target(&options.output_dir, &name, false)? else {
                 continue;
             };
-            let entry_type = entry.header().entry_type();
 
             if entry_type.is_dir() {
                 dirs.insert(target_path);
@@ -125,6 +137,11 @@ impl TarHandler {
             .iter()
             .fold(0u64, |acc, item| acc.saturating_add(item.size));
         let average_size = total_size / files.len() as u64;
+        // Only the indexed (parallel) path knows the total up front; streamed
+        // TAR reports bytes without a percentage.
+        if let Some(progress) = &options.progress {
+            progress.set_total(total_size);
+        }
 
         for dir in &dirs {
             fs::create_dir_all(dir)?;
@@ -138,7 +155,7 @@ impl TarHandler {
             for item in &files {
                 source.seek(SeekFrom::Start(item.offset))?;
                 let mut reader = Read::by_ref(&mut source).take(item.size);
-                file_io::copy_to_file(&mut reader, &item.target, item.size)?;
+                file_io::copy_to_file(&mut reader, &item.target, item.size, options.progress.as_deref())?;
             }
             return Ok(true);
         }
@@ -187,7 +204,7 @@ impl TarHandler {
                                 None
                             };
                             let mut reader = Read::by_ref(&mut source).take(item.size);
-                            file_io::copy_to_file(&mut reader, &item.target, item.size)?;
+                            file_io::copy_to_file(&mut reader, &item.target, item.size, options.progress.as_deref())?;
                             Ok(())
                         })();
 
@@ -238,14 +255,7 @@ impl ArchiveReader for TarHandler {
     }
 
     fn extract(&mut self, options: &ExtractOptions, filter: Option<&[String]>) -> Result<()> {
-        let num_threads = options
-            .threads
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            })
-            .max(1);
+        let num_threads = options.thread_count();
 
         if num_threads > 1 && self.try_extract_plain_parallel(options, filter, num_threads)? {
             return Ok(());
@@ -263,11 +273,22 @@ impl ArchiveReader for TarHandler {
 
         let mut known_dirs: HashSet<PathBuf> = HashSet::new();
         known_dirs.insert(options.output_dir.clone());
+        // Files written by this run: the only valid hard-link sources.
+        let mut extracted: HashSet<PathBuf> = HashSet::new();
 
         for entry in archive.entries()? {
             let mut entry = entry?;
-            let name = entry.path()?.to_string_lossy().to_string();
+            let entry_type = entry.header().entry_type();
 
+            // Metadata records, not files (e.g. git's `pax_global_header`).
+            if matches!(
+                entry_type,
+                EntryType::XGlobalHeader | EntryType::XHeader | EntryType::GNULongName | EntryType::GNULongLink
+            ) {
+                continue;
+            }
+
+            let name = entry.path()?.to_string_lossy().to_string();
             if !paths::matches_filter(filter, &name) {
                 continue;
             }
@@ -277,36 +298,93 @@ impl ArchiveReader for TarHandler {
                 continue;
             };
 
-            if entry.header().entry_type().is_dir() {
+            if entry_type.is_dir() {
                 if !options.flat && known_dirs.insert(target_path.clone()) {
                     fs::create_dir_all(&target_path)?;
                 }
-            } else {
-                if let Some(parent) = target_path.parent() {
-                    if !known_dirs.contains(parent) {
-                        fs::create_dir_all(parent)?;
-                        known_dirs.insert(parent.to_path_buf());
+                continue;
+            }
+
+            match entry_type {
+                EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
+                    create_parent(&target_path, &mut known_dirs)?;
+                    let size = entry.size();
+                    file_io::copy_to_file(&mut entry, &target_path, size, options.progress.as_deref())?;
+                    extracted.insert(target_path);
+                }
+                EntryType::Link => {
+                    // A hard link is written as a copy of its target, which
+                    // must be a file this run already extracted. No link is
+                    // created, so it cannot point anywhere else.
+                    let link = entry.link_name()?.map(|link| link.to_string_lossy().to_string());
+                    let source = link
+                        .as_deref()
+                        .and_then(|link| paths::entry_target(&options.output_dir, link, options.flat).ok().flatten())
+                        .filter(|source| source != &target_path && extracted.contains(source));
+                    match source {
+                        Some(source) => {
+                            create_parent(&target_path, &mut known_dirs)?;
+                            let size = fs::metadata(&source)?.len();
+                            let mut reader = File::open(&source)?;
+                            file_io::copy_to_file(&mut reader, &target_path, size, options.progress.as_deref())?;
+                            extracted.insert(target_path);
+                        }
+                        None => warn(
+                            options,
+                            format!(
+                                "skipped hard link {name} -> {}: target was not extracted from this archive",
+                                link.as_deref().unwrap_or("?")
+                            ),
+                        ),
                     }
                 }
-                let size = entry.size();
-                file_io::copy_to_file(&mut entry, &target_path, size)?;
+                EntryType::Symlink => {
+                    // Never created: a link can redirect later entries outside
+                    // the output directory.
+                    let link = entry.link_name()?.map(|link| link.to_string_lossy().to_string());
+                    warn(
+                        options,
+                        format!("skipped symbolic link {name} -> {}", link.as_deref().unwrap_or("?")),
+                    );
+                }
+                _ => warn(options, format!("skipped special file {name} ({entry_type:?})")),
             }
         }
 
         Ok(())
     }
 
-    fn test(&mut self, _password: Option<&str>) -> Result<()> {
+    fn test(&mut self, _password: Option<&str>, progress: Option<&Progress>) -> Result<()> {
         let reader = self.open_reader()?;
         let mut archive = tar::Archive::new(reader);
 
-        let mut out = sink();
+        // Streamed: the total is unknown, so only bytes are reported.
         for entry in archive.entries()? {
             let mut entry = entry?;
-            copy(&mut entry, &mut out)?;
+            file_io::drain(&mut entry, progress)?;
         }
 
         Ok(())
+    }
+}
+
+/// Creates `path`'s parent directory once per directory.
+fn create_parent(path: &Path, known_dirs: &mut HashSet<PathBuf>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !known_dirs.contains(parent)
+    {
+        fs::create_dir_all(parent)?;
+        known_dirs.insert(parent.to_path_buf());
+    }
+    Ok(())
+}
+
+/// Reports an entry that was skipped: to the caller's progress handle when
+/// there is one (the GUI shows it), otherwise on stderr (the CLI).
+fn warn(options: &ExtractOptions, message: String) {
+    match &options.progress {
+        Some(progress) => progress.warn(message),
+        None => eprintln!("Warning: {message}"),
     }
 }
 
@@ -366,6 +444,17 @@ impl ArchiveWriter for TarHandler {
 
 type ArchiveFile = BufWriter<File>;
 
+/// Encoder memory allowed across xz workers, as for the 7z writer.
+const XZ_MEMORY_BUDGET_KIB: u64 = 1536 * 1024;
+
+/// Workers that fit the memory budget: each holds an encoder plus an input
+/// and an output block.
+fn xz_worker_count(requested: usize, options: &XzOptions, block_size: u64) -> usize {
+    let per_worker_kib = options.lzma_options.get_memory_usage() as u64 + 2 * block_size / 1024;
+    let by_memory = (XZ_MEMORY_BUDGET_KIB / per_worker_kib.max(1)).max(1) as usize;
+    requested.min(by_memory).clamp(1, 256)
+}
+
 /// The byte sink behind `tar::Builder`: the archive file itself, a
 /// single-stream encoder, or the block-parallel compressor.
 enum TarOutput {
@@ -373,22 +462,22 @@ enum TarOutput {
     Gzip(GzEncoder<ArchiveFile>),
     Bzip2(BzEncoder<ArchiveFile>),
     Parallel(ParallelCompressor<ArchiveFile>),
+    Xz(XzWriter<ArchiveFile>),
+    /// xz has its own block-parallel encoder; it writes one standard stream.
+    XzMt(XzWriterMt<ArchiveFile>),
 }
 
 impl TarOutput {
     fn new(file: ArchiveFile, format: ArchiveFormat, options: &CompressionOptions) -> Result<Self> {
         let codec = match format {
             ArchiveFormat::Tar => return Ok(Self::Plain(file)),
+            ArchiveFormat::TarXz => return Self::xz(file, options),
             ArchiveFormat::TarGz => Codec::Gzip(options.level.clamp(0, 9) as u32),
             ArchiveFormat::TarBz2 => Codec::Bzip2(options.level.clamp(1, 9) as u32),
             _ => anyhow::bail!("Invalid tar archive target"),
         };
 
-        let requested = options.threads.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        });
+        let requested = options.thread_count();
         let workers = stream_compress::worker_count(codec, requested);
         if workers > 1 {
             return Ok(Self::Parallel(ParallelCompressor::new(file, codec, workers)?));
@@ -401,6 +490,27 @@ impl TarOutput {
         })
     }
 
+    /// The xz encoder: block-parallel when more than one worker fits in the
+    /// encoder memory budget, single-threaded otherwise.
+    fn xz(file: ArchiveFile, options: &CompressionOptions) -> Result<Self> {
+        let mut xz_options = XzOptions::with_preset(options.level.min(9) as u32);
+        if let Some(dict_size) = options.dict_size {
+            xz_options.lzma_options.dict_size = dict_size.clamp(DICT_SIZE_MIN, DICT_SIZE_MAX);
+        }
+
+        let requested = options.thread_count();
+        // Blocks of 3 × the dictionary, as xz itself uses (at least 1 MiB).
+        let block_size = (3 * xz_options.lzma_options.dict_size as u64).max(1024 * 1024);
+        let workers = xz_worker_count(requested, &xz_options, block_size);
+
+        if workers > 1 {
+            xz_options.set_block_size(NonZeroU64::new(block_size));
+            Ok(Self::XzMt(XzWriterMt::new(file, xz_options, workers as u32)?))
+        } else {
+            Ok(Self::Xz(XzWriter::new(file, xz_options)?))
+        }
+    }
+
     /// Write the compressed stream's trailer and flush the archive file.
     /// Dropping an encoder instead would swallow errors from the final write.
     fn finish(self) -> std::io::Result<()> {
@@ -409,6 +519,8 @@ impl TarOutput {
             Self::Gzip(enc) => enc.finish()?,
             Self::Bzip2(enc) => enc.finish()?,
             Self::Parallel(enc) => enc.finish()?,
+            Self::Xz(enc) => enc.finish()?,
+            Self::XzMt(enc) => enc.finish()?,
         };
         file.flush()
     }
@@ -421,6 +533,8 @@ impl Write for TarOutput {
             Self::Gzip(w) => w.write(buf),
             Self::Bzip2(w) => w.write(buf),
             Self::Parallel(w) => w.write(buf),
+            Self::Xz(w) => w.write(buf),
+            Self::XzMt(w) => w.write(buf),
         }
     }
 
@@ -430,6 +544,8 @@ impl Write for TarOutput {
             Self::Gzip(w) => w.write_all(buf),
             Self::Bzip2(w) => w.write_all(buf),
             Self::Parallel(w) => w.write_all(buf),
+            Self::Xz(w) => w.write_all(buf),
+            Self::XzMt(w) => w.write_all(buf),
         }
     }
 
@@ -439,6 +555,8 @@ impl Write for TarOutput {
             Self::Gzip(w) => w.flush(),
             Self::Bzip2(w) => w.flush(),
             Self::Parallel(w) => w.flush(),
+            Self::Xz(w) => w.flush(),
+            Self::XzMt(w) => w.flush(),
         }
     }
 }

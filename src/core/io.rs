@@ -5,6 +5,8 @@ use std::path::Path;
 
 use memmap2::{Mmap, MmapOptions};
 
+use crate::core::progress::Progress;
+
 /// Buffer size for large sequential reads and writes. Large enough to keep
 /// syscall overhead low without making per-worker memory noticeable.
 pub(crate) const IO_BUFFER_SIZE: usize = 256 * 1024;
@@ -87,26 +89,66 @@ thread_local! {
 
 /// Copy a stream of known size, using the thread-local buffer for large
 /// entries and `std::io::copy`'s stack buffer for small ones.
+///
+/// With `progress`, cancellation is checked before each buffer (and before
+/// a small entry) and the bytes copied are reported.
 fn copy_stream<R: Read + ?Sized, W: Write + ?Sized>(
     reader: &mut R,
     writer: &mut W,
     size: u64,
+    progress: Option<&Progress>,
 ) -> io::Result<()> {
     if size < SMALL_FILE_THRESHOLD {
-        io::copy(reader, writer)?;
+        if let Some(progress) = progress {
+            progress.check()?;
+        }
+        let copied = io::copy(reader, writer)?;
+        if let Some(progress) = progress {
+            progress.add(copied);
+        }
         return Ok(());
     }
 
     COPY_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
         loop {
+            if let Some(progress) = progress {
+                progress.check()?;
+            }
             let read = reader.read(&mut buffer[..])?;
             if read == 0 {
                 break;
             }
             writer.write_all(&buffer[..read])?;
+            if let Some(progress) = progress {
+                progress.add(read as u64);
+            }
         }
         Ok(())
+    })
+}
+
+/// Read a stream to the end without keeping it (archive testing): the
+/// decoder still decompresses and verifies every byte.
+pub(crate) fn drain<R: Read + ?Sized>(reader: &mut R, progress: Option<&Progress>) -> io::Result<u64> {
+    let mut sink = io::sink();
+    let mut total = 0u64;
+    COPY_BUFFER.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        loop {
+            if let Some(progress) = progress {
+                progress.check()?;
+            }
+            let read = reader.read(&mut buffer[..])?;
+            if read == 0 {
+                return Ok(total);
+            }
+            sink.write_all(&buffer[..read])?;
+            total += read as u64;
+            if let Some(progress) = progress {
+                progress.add(read as u64);
+            }
+        }
     })
 }
 
@@ -157,7 +199,7 @@ pub(crate) fn copy_file_to<W: Write>(path: &Path, size: u64, writer: &mut W) -> 
 
         if offset == 0 {
             let mut file = file;
-            return copy_stream(&mut file, writer, size);
+            return copy_stream(&mut file, writer, size, None);
         }
 
         return Err(io::Error::other(
@@ -166,25 +208,48 @@ pub(crate) fn copy_file_to<W: Write>(path: &Path, size: u64, writer: &mut W) -> 
     }
 
     let mut file = file;
-    copy_stream(&mut file, writer, size)
+    copy_stream(&mut file, writer, size, None)
 }
 
 /// Write a decompressed entry to disk. Small entries are written directly;
 /// large ones reuse the thread-local copy buffer.
+///
+/// If the copy fails or is cancelled, the partly written file is removed so
+/// a truncated file is never left looking complete.
 pub(crate) fn copy_to_file<R: Read + ?Sized>(
     reader: &mut R,
     path: &Path,
     size: u64,
+    progress: Option<&Progress>,
 ) -> io::Result<()> {
+    if let Some(progress) = progress {
+        progress.check()?;
+    }
     let mut file = File::create(path)?;
-    copy_stream(reader, &mut file, size)
+    let result = copy_stream(reader, &mut file, size, progress);
+    if result.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    result
 }
 
 /// Write an entry that is already fully decoded in memory. Avoids a
 /// `BufWriter` allocation and an extra copy for small-file extraction.
-pub(crate) fn write_buffer(path: &Path, data: &[u8]) -> io::Result<()> {
+pub(crate) fn write_buffer(path: &Path, data: &[u8], progress: Option<&Progress>) -> io::Result<()> {
+    if let Some(progress) = progress {
+        progress.check()?;
+    }
     let mut file = File::create(path)?;
-    file.write_all(data)
+    if let Err(err) = file.write_all(data) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(err);
+    }
+    if let Some(progress) = progress {
+        progress.add(data.len() as u64);
+    }
+    Ok(())
 }
 
 /// Size of each block handed from a read-ahead thread to its consumer.
@@ -356,5 +421,77 @@ mod tests {
 
         assert_eq!(read, payload);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Reads `remaining` bytes of 0xAB and cancels `progress` after
+    /// `cancel_after` bytes have been handed out.
+    struct CancellingReader<'a> {
+        remaining: usize,
+        handed_out: usize,
+        cancel_after: usize,
+        progress: &'a Progress,
+    }
+
+    impl Read for CancellingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.remaining).min(64 * 1024);
+            buf[..n].fill(0xAB);
+            self.remaining -= n;
+            self.handed_out += n;
+            if self.handed_out >= self.cancel_after {
+                self.progress.cancel();
+            }
+            Ok(n)
+        }
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("openarchive-io-{tag}-{}.bin", std::process::id()))
+    }
+
+    #[test]
+    fn copy_to_file_reports_bytes() {
+        let path = temp_path("count");
+        let progress = Progress::new();
+        let size = 3 * 1024 * 1024;
+        let mut reader = CancellingReader { remaining: size, handed_out: 0, cancel_after: usize::MAX, progress: &progress };
+        copy_to_file(&mut reader, &path, size as u64, Some(&progress)).unwrap();
+        assert_eq!(progress.done(), size as u64);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size as u64);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cancelled_copy_stops_and_removes_the_partial_file() {
+        let path = temp_path("cancel");
+        let progress = Progress::new();
+        let size = 8 * 1024 * 1024;
+        let mut reader = CancellingReader { remaining: size, handed_out: 0, cancel_after: 1024 * 1024, progress: &progress };
+
+        let err = copy_to_file(&mut reader, &path, size as u64, Some(&progress)).unwrap_err();
+        assert!(err.get_ref().is_some_and(|inner| inner.is::<crate::core::Cancelled>()), "{err}");
+        assert!(!path.exists(), "partial file must be removed");
+        // It stopped soon after the cancel, not at the end.
+        assert!(reader.handed_out < size, "copy ran to the end");
+        assert!(progress.done() < size as u64);
+    }
+
+    #[test]
+    fn small_and_buffered_writes_respect_cancellation() {
+        let progress = Progress::new();
+        progress.cancel();
+        let path = temp_path("small");
+        assert!(write_buffer(&path, b"data", Some(&progress)).is_err());
+        assert!(copy_to_file(&mut &b"data"[..], &path, 4, Some(&progress)).is_err());
+        assert!(!path.exists());
+        assert!(drain(&mut &b"data"[..], Some(&progress)).is_err());
+    }
+
+    #[test]
+    fn drain_counts_without_writing() {
+        let progress = Progress::new();
+        let data = vec![7u8; 300_000];
+        assert_eq!(drain(&mut &data[..], Some(&progress)).unwrap(), 300_000);
+        assert_eq!(progress.done(), 300_000);
     }
 }

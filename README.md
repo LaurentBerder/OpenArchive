@@ -13,7 +13,7 @@
 
 <p align="center">
   A modern, pure-Rust archive manager with a file-manager-style GUI and a 7-Zip–compatible CLI.<br/>
-  No C/C++ dependencies. Handles <code>.7z</code>, <code>.zip</code>, <code>.tar</code>, <code>.tar.gz</code>, and <code>.tar.bz2</code>.
+  No C/C++ dependencies. Handles <code>.7z</code>, <code>.zip</code>, <code>.tar</code>, <code>.tar.gz</code>, <code>.tar.bz2</code>, and <code>.tar.xz</code>.
 </p>
 
 ---
@@ -24,7 +24,7 @@
 |---|---|
 | 🖥️ **GUI** | File-manager interface, navigate disk & archives, double-click to open, rubber-band multi-select |
 | ⌨️ **CLI** | 7-Zip–compatible commands (`a`, `x`, `e`, `l`, `t`), familiar switches (`-o`, `-p`, `-mx`) |
-| 📦 **Formats** | `.7z` · `.zip` · `.tar` · `.tar.gz` · `.tar.bz2` |
+| 📦 **Formats** | `.7z` · `.zip` · `.tar` · `.tar.gz` · `.tar.bz2` · `.tar.xz` |
 | 🦀 **Pure Rust** | Zero C/C++ runtime dependencies; single statically-linked binary |
 | 🪟 **Windows** | Native MSI installer, taskbar icon, silent GUI launcher (no console window) |
 
@@ -188,7 +188,7 @@ OpenArchive
 │   └── formats/
 │       ├── sevenz.rs            # .7z handler
 │       ├── zip.rs               # .zip handler
-│       └── tar.rs               # .tar / .tar.gz / .tar.bz2 handler
+│       └── tar.rs               # .tar / .tar.gz / .tar.bz2 / .tar.xz handler
 ├── src/bin/
 │   └── openarchive-gui.rs       # Silent GUI launcher (no console window)
 ├── tests/
@@ -208,7 +208,7 @@ flowchart TD
     GUI --> Core
     Core --> SevenZ["formats/sevenz.rs\n(.7z)"]
     Core --> Zip["formats/zip.rs\n(.zip)"]
-    Core --> Tar["formats/tar.rs\n(.tar / .tar.gz / .tar.bz2)"]
+    Core --> Tar["formats/tar.rs\n(.tar / .tar.gz / .tar.bz2 / .tar.xz)"]
 ```
 
 ---

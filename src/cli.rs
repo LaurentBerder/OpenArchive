@@ -177,9 +177,7 @@ impl CliArgs {
             } else if arg.starts_with("-mmt") {
                 let val = arg[4..].trim_start_matches('=').trim().to_lowercase();
                 if val.is_empty() || val == "on" || val == "+" || val == "yes" {
-                    let count = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1);
+                    let count = crate::core::available_threads();
                     threads = Some(count);
                 } else if val == "off" || val == "-" || val == "no" {
                     threads = Some(1);
@@ -189,9 +187,7 @@ impl CliArgs {
                     let next_val = raw[i + 1].trim_start_matches('=').trim().to_lowercase();
                     if next_val == "on" || next_val == "+" || next_val == "yes" {
                         i += 1;
-                        let count = std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(1);
+                        let count = crate::core::available_threads();
                         threads = Some(count);
                     } else if next_val == "off" || next_val == "-" || next_val == "no" {
                         i += 1;

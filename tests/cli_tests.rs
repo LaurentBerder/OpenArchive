@@ -352,7 +352,7 @@ fn test_tar_roundtrip_formats() {
 
     let exe = env!("CARGO_BIN_EXE_openarchive");
 
-    for ext in ["tar", "tar.gz", "tar.bz2"] {
+    for ext in ["tar", "tar.gz", "tar.bz2", "tar.xz"] {
         let archive = format!("archive_roundtrip.{}", ext);
         let created = Command::new(exe)
             .args(["a", &archive, test_dir, "-mx=5"])
@@ -1423,4 +1423,108 @@ fn test_zip_empty_password_means_unencrypted() {
     assert!(!zip.by_index_raw(0).unwrap().encrypted());
 
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_tar_skipped_links_are_reported_on_stderr() {
+    let dir = PathBuf::from("test_tar_link_warnings");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut file = tar::Header::new_gnu();
+    file.set_size(5);
+    file.set_mode(0o644);
+    file.set_cksum();
+    builder.append_data(&mut file, "a.txt", &b"hello"[..]).unwrap();
+    let mut link = tar::Header::new_gnu();
+    link.set_entry_type(tar::EntryType::Symlink);
+    link.set_size(0);
+    link.set_mode(0o777);
+    builder.append_link(&mut link, "s.txt", "a.txt").unwrap();
+    let archive = dir.join("links.tar");
+    fs::write(&archive, builder.into_inner().unwrap()).unwrap();
+
+    let out = dir.join("out");
+    let output = Command::new(env!("CARGO_BIN_EXE_openarchive"))
+        .args(["x", archive.to_str().unwrap(), "-o", out.to_str().unwrap(), "-mmt=1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Warning: skipped symbolic link s.txt -> a.txt"), "{stderr}");
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"hello");
+    assert!(fs::symlink_metadata(out.join("s.txt")).is_err());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_tar_xz_roundtrip_single_and_multithreaded() {
+    let dir = PathBuf::from("test_tar_xz");
+    let _ = fs::remove_dir_all(&dir);
+    let src = dir.join("src");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    // 8 MB of mildly compressible data: several 3 MiB blocks at -mx=1.
+    let big: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| ((i / 7) % 251) as u8).collect();
+    fs::write(src.join("big.bin"), &big).unwrap();
+    fs::write(src.join("sub/small.txt"), b"small").unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    for (name, level, threads) in [
+        ("st.tar.xz", "-mx=1", "-mmt=1"),
+        ("mt.tar.xz", "-mx=1", "-mmt=4"),
+        ("store.txz", "-mx=0", "-mmt=1"),
+    ] {
+        let archive = dir.join(name);
+        let created = Command::new(exe)
+            .current_dir(&dir)
+            .args(["a", name, "src", level, threads])
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{name}: {}", String::from_utf8_lossy(&created.stderr));
+        // xz stream magic.
+        assert_eq!(&fs::read(&archive).unwrap()[..6], &[0xFD, b'7', b'z', b'X', b'Z', 0x00], "{name}");
+
+        let tested = Command::new(exe).args(["t", archive.to_str().unwrap()]).output().unwrap();
+        assert!(tested.status.success(), "{name}: test");
+
+        let out = dir.join(format!("out-{name}"));
+        let extracted = Command::new(exe)
+            .args(["x", archive.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(extracted.status.success(), "{name}: extract");
+        assert_eq!(fs::read(out.join("src/big.bin")).unwrap(), big, "{name}");
+        assert_eq!(fs::read(out.join("src/sub/small.txt")).unwrap(), b"small", "{name}");
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_misnamed_archive_is_opened_by_content() {
+    let dir = PathBuf::from("test_misnamed_archive");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/a.txt"), b"by content").unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    let created = Command::new(exe).current_dir(&dir).args(["a", "real.7z", "src"]).output().unwrap();
+    assert!(created.status.success());
+    fs::rename(dir.join("real.7z"), dir.join("misnamed.zip")).unwrap();
+
+    let listed = Command::new(exe).args(["l", dir.join("misnamed.zip").to_str().unwrap()]).output().unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("Type = 7z"));
+
+    let out = dir.join("out");
+    let extracted = Command::new(exe)
+        .args(["x", dir.join("misnamed.zip").to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(extracted.status.success(), "{}", String::from_utf8_lossy(&extracted.stderr));
+    assert_eq!(fs::read(out.join("src/a.txt")).unwrap(), b"by content");
+
+    let _ = fs::remove_dir_all(&dir);
 }

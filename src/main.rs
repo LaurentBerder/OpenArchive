@@ -35,7 +35,7 @@ fn print_help() {
     println!("  -r           : Recurse subdirectories");
     println!("  -y           : Assume Yes on all queries");
     println!();
-    println!("Supported Formats: .7z, .zip, .tar, .tar.gz, .tar.bz2");
+    println!("Supported Formats: .7z, .zip, .tar, .tar.gz, .tar.bz2, .tar.xz");
 }
 
 fn main() -> Result<()> {
@@ -101,7 +101,7 @@ fn main() -> Result<()> {
             print_banner();
             println!("Listing archive: {}\n", args.archive.display());
 
-            let format = ArchiveFormat::from_path(&args.archive)
+            let format = ArchiveFormat::detect(&args.archive)
                 .unwrap_or(ArchiveFormat::SevenZip);
 
             let meta = fs::metadata(&args.archive)?;
@@ -172,6 +172,7 @@ fn main() -> Result<()> {
                 password: args.password,
                 overwrite: true,
                 threads: args.threads,
+                progress: None,
             };
 
             if let Some(th) = extract_opts.threads {
@@ -189,7 +190,7 @@ fn main() -> Result<()> {
             println!("Testing archive: {}\n", args.archive.display());
 
             let mut reader = get_reader(&args.archive, args.password.clone())?;
-            reader.test(args.password.as_deref())?;
+            reader.test(args.password.as_deref(), None)?;
 
             println!("\nTesting completed in {:.2?}", start_time.elapsed());
             println!("Everything is Ok");

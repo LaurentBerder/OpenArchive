@@ -1,8 +1,24 @@
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+mod detect;
 pub(crate) mod io;
 pub(crate) mod paths;
+pub mod progress;
+
+pub use progress::{Cancelled, Progress};
+
+/// Logical CPUs available to this process (at least 1).
+pub fn available_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// Threads to use: the requested count (`-mmt`), or every available CPU;
+/// never 0.
+fn resolve_threads(requested: Option<usize>) -> usize {
+    requested.unwrap_or_else(available_threads).max(1)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
@@ -11,6 +27,7 @@ pub enum ArchiveFormat {
     Tar,
     TarGz,
     TarBz2,
+    TarXz,
 }
 
 impl ArchiveFormat {
@@ -24,6 +41,9 @@ impl ArchiveFormat {
         if file_name.ends_with(".tar.bz2") || file_name.ends_with(".tbz2") {
             return Some(Self::TarBz2);
         }
+        if file_name.ends_with(".tar.xz") || file_name.ends_with(".txz") {
+            return Some(Self::TarXz);
+        }
         if file_name.ends_with(".7z") {
             return Some(Self::SevenZip);
         }
@@ -34,31 +54,19 @@ impl ArchiveFormat {
             return Some(Self::Tar);
         }
 
-        // Try detecting by magic bytes if file exists
-        if let Ok(mut file) = std::fs::File::open(path) {
-            use std::io::Read;
-            let mut magic = [0u8; 6];
-            if file.read_exact(&mut magic).is_ok() {
-                // 7z: 37 7A BC AF 27 1C
-                if &magic == &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C] {
-                    return Some(Self::SevenZip);
-                }
-                // Zip: 50 4B 03 04 or 50 4B 05 06
-                if &magic[0..2] == &[0x50, 0x4B] {
-                    return Some(Self::Zip);
-                }
-                // Gz: 1F 8B
-                if &magic[0..2] == &[0x1F, 0x8B] {
-                    return Some(Self::TarGz);
-                }
-                // Bz2: 42 5A
-                if &magic[0..2] == &[0x42, 0x5A] {
-                    return Some(Self::TarBz2);
-                }
-            }
-        }
+        // No known extension: look at the content, if the file exists.
+        detect::detect_content(path)
+    }
 
-        None
+    /// The format of an existing archive, for opening it: its content first
+    /// (7-Zip does the same, so a 7z named `.zip` still opens), then its name.
+    ///
+    /// Use [`Self::from_path`] to choose the format of an archive being
+    /// created: there the name decides, even if an older file of another
+    /// format is in the way.
+    pub fn detect<P: AsRef<Path>>(path: P) -> Option<Self> {
+        let path = path.as_ref();
+        detect::detect_content(path).or_else(|| Self::from_path(path))
     }
 
     pub fn display_name(&self) -> &'static str {
@@ -68,6 +76,7 @@ impl ArchiveFormat {
             Self::Tar => "tar",
             Self::TarGz => "tar.gz",
             Self::TarBz2 => "tar.bz2",
+            Self::TarXz => "tar.xz",
         }
     }
 }
@@ -94,6 +103,13 @@ pub struct CompressionOptions {
     pub threads: Option<usize>, // Thread count (None = automatic / default)
 }
 
+impl CompressionOptions {
+    /// Threads to compress with: `threads` (`-mmt`), or every CPU.
+    pub fn thread_count(&self) -> usize {
+        resolve_threads(self.threads)
+    }
+}
+
 impl Default for CompressionOptions {
     fn default() -> Self {
         Self {
@@ -114,6 +130,16 @@ pub struct ExtractOptions {
     pub password: Option<String>,
     pub overwrite: bool,
     pub threads: Option<usize>,
+    /// Reports bytes written and lets the caller cancel. On cancellation the
+    /// file being written is removed and extraction fails with [`Cancelled`].
+    pub progress: Option<Arc<Progress>>,
+}
+
+impl ExtractOptions {
+    /// Threads to extract with: `threads` (`-mmt`), or every CPU.
+    pub fn thread_count(&self) -> usize {
+        resolve_threads(self.threads)
+    }
 }
 
 impl Default for ExtractOptions {
@@ -124,6 +150,7 @@ impl Default for ExtractOptions {
             password: None,
             overwrite: true,
             threads: None,
+            progress: None,
         }
     }
 }
@@ -135,7 +162,9 @@ pub trait ArchiveReader {
         options: &ExtractOptions,
         filter: Option<&[String]>,
     ) -> anyhow::Result<()>;
-    fn test(&mut self, password: Option<&str>) -> anyhow::Result<()>;
+    /// Decompresses every entry and verifies it. `progress`, if given,
+    /// receives the bytes verified and can cancel the test.
+    fn test(&mut self, password: Option<&str>, progress: Option<&Progress>) -> anyhow::Result<()>;
 }
 
 pub trait ArchiveWriter {
@@ -144,4 +173,21 @@ pub trait ArchiveWriter {
         files: &[PathBuf],
         options: &CompressionOptions,
     ) -> anyhow::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_count_defaults_to_every_cpu_and_is_never_zero() {
+        let extract = |threads| ExtractOptions { threads, ..Default::default() };
+        assert_eq!(extract(None).thread_count(), available_threads());
+        assert_eq!(extract(Some(3)).thread_count(), 3);
+        assert_eq!(extract(Some(0)).thread_count(), 1);
+
+        let compress = |threads| CompressionOptions { threads, ..Default::default() };
+        assert_eq!(compress(None).thread_count(), available_threads());
+        assert_eq!(compress(Some(0)).thread_count(), 1);
+    }
 }
