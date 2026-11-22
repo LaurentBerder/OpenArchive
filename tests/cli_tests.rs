@@ -392,6 +392,383 @@ fn test_tar_roundtrip_formats() {
     let _ = fs::remove_dir_all(test_dir);
 }
 
+/// Build an in-memory TAR with a few entries whose combined data spans
+/// several 512-byte records, so a split lands mid-entry.
+fn sample_tar_bytes(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, data) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, &data[..]).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+#[test]
+fn test_tar_reads_multi_member_streams() {
+    use std::io::Write;
+
+    // pigz/pbzip2-style output: the stream is split into independent gzip
+    // members / bzip2 streams and concatenated. Decoders must read past the
+    // first member instead of stopping (or reporting a truncated archive).
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("multi/a.txt", b"first entry".to_vec()),
+        ("multi/b.bin", (0..200_000u32).map(|i| (i % 251) as u8).collect()),
+        ("multi/c.txt", b"last entry".to_vec()),
+    ];
+    let tar_bytes = sample_tar_bytes(&entries);
+    let parts: Vec<&[u8]> = tar_bytes.chunks(tar_bytes.len() / 3 + 1).collect();
+    assert!(parts.len() >= 3);
+
+    let mut gz = Vec::new();
+    let mut bz = Vec::new();
+    for part in &parts {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        enc.write_all(part).unwrap();
+        gz.extend(enc.finish().unwrap());
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(9));
+        enc.write_all(part).unwrap();
+        bz.extend(enc.finish().unwrap());
+    }
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    for (ext, data) in [("tar.gz", gz), ("tar.bz2", bz)] {
+        let archive = format!("archive_multi_member.{}", ext);
+        fs::write(&archive, data).unwrap();
+
+        let tested = Command::new(exe).args(["t", &archive]).status().unwrap();
+        assert!(tested.success(), "failed to test {}", archive);
+
+        let out_dir = format!("out_multi_member_{}", ext.replace('.', "_"));
+        let extracted = Command::new(exe)
+            .args(["x", &archive, "-o", &out_dir])
+            .status()
+            .unwrap();
+        assert!(extracted.success(), "failed to extract {}", archive);
+        for (name, data) in &entries {
+            assert_eq!(
+                &fs::read(PathBuf::from(&out_dir).join(name)).unwrap(),
+                data,
+                "{} mismatch in {}",
+                name,
+                archive
+            );
+        }
+
+        let _ = fs::remove_dir_all(&out_dir);
+        let _ = fs::remove_file(&archive);
+    }
+}
+
+/// TAR with a raw entry name: `tar::Builder::append_data` refuses `..`, so
+/// the header name bytes are written directly.
+fn tar_with_raw_names(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, data) in entries {
+        let mut header = tar::Header::new_gnu();
+        let name_field = &mut header.as_old_mut().name;
+        assert!(name.len() < name_field.len());
+        name_field[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder.append(&header, *data).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+#[test]
+fn test_extraction_rejects_path_traversal() {
+    use std::io::Write;
+
+    let sandbox = PathBuf::from("slip_sandbox");
+    let _ = fs::remove_dir_all(&sandbox);
+    fs::create_dir_all(&sandbox).unwrap();
+    let out_dir = sandbox.join("out");
+    // An absolute name that, if honoured, lands inside the sandbox rather
+    // than somewhere unexpected on the machine.
+    let absolute = fs::canonicalize(&sandbox)
+        .unwrap()
+        .join("abs_escape.txt")
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    let check = |archive: &PathBuf, extra_args: &[&str], label: &str| {
+        let _ = fs::remove_dir_all(&out_dir);
+        let mut args = vec![
+            "x".to_string(),
+            archive.to_string_lossy().to_string(),
+            "-o".to_string(),
+            out_dir.to_string_lossy().to_string(),
+        ];
+        args.extend(extra_args.iter().map(|s| s.to_string()));
+        let output = Command::new(exe).args(&args).output().unwrap();
+        assert!(output.status.success(), "{label}: extraction failed");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("outside the output directory"),
+            "{label}: expected a warning"
+        );
+        assert_eq!(
+            fs::read_to_string(out_dir.join("safe").join("ok.txt")).unwrap(),
+            "safe",
+            "{label}: safe entry must still be extracted"
+        );
+        for escaped in ["escape.txt", "escape2.txt", "abs_escape.txt"] {
+            assert!(
+                !sandbox.join(escaped).exists(),
+                "{label}: {escaped} escaped the output directory"
+            );
+        }
+    };
+
+    // TAR / TAR.GZ: plain TAR takes the parallel indexed path with threads
+    // and the sequential path with -mmt=1; TAR.GZ is always sequential.
+    let tar_bytes = tar_with_raw_names(&[
+        ("safe/ok.txt", b"safe"),
+        ("../escape.txt", b"evil"),
+        ("safe/../../escape2.txt", b"evil"),
+    ]);
+    let tar_path = sandbox.join("slip.tar");
+    fs::write(&tar_path, &tar_bytes).unwrap();
+    check(&tar_path, &["-mmt=4"], "tar parallel");
+    check(&tar_path, &["-mmt=1"], "tar sequential");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+    gz.write_all(&tar_bytes).unwrap();
+    let tgz_path = sandbox.join("slip.tar.gz");
+    fs::write(&tgz_path, gz.finish().unwrap()).unwrap();
+    check(&tgz_path, &[], "tar.gz");
+
+    // ZIP, including an absolute name.
+    let zip_path = sandbox.join("slip.zip");
+    {
+        let mut zip = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, data) in [
+            ("safe/ok.txt", "safe"),
+            ("../escape.txt", "evil"),
+            ("safe/../../escape2.txt", "evil"),
+            (absolute.as_str(), "evil"),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(data.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    check(&zip_path, &["-mmt=4"], "zip parallel");
+    check(&zip_path, &["-mmt=1"], "zip sequential");
+
+    // 7z, sequential and pipelined extraction.
+    let sz_path = sandbox.join("slip.7z");
+    {
+        let mut writer = sevenz_rust2::ArchiveWriter::create(&sz_path).unwrap();
+        for (name, data) in [
+            ("safe/ok.txt", "safe"),
+            ("../escape.txt", "evil"),
+            ("safe/../../escape2.txt", "evil"),
+            (absolute.as_str(), "evil"),
+        ] {
+            writer
+                .push_archive_entry(
+                    sevenz_rust2::ArchiveEntry::new_file(name),
+                    Some(data.as_bytes()),
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    check(&sz_path, &["-mmt=4"], "7z pipelined");
+    check(&sz_path, &["-mmt=1"], "7z sequential");
+
+    let _ = fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn test_tar_symlink_entries_are_not_followed() {
+    // `d -> ../..` followed by `d/x`: if extraction created the link, `d/x`
+    // would pass the name check yet land two levels above the output dir.
+    let sandbox = PathBuf::from("symlink_sandbox");
+    let _ = fs::remove_dir_all(&sandbox);
+    let out_dir = sandbox.join("deep").join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, target) in [("d", "../.."), ("h", "../../hard_target")] {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(if name == "d" {
+            tar::EntryType::Symlink
+        } else {
+            tar::EntryType::Link
+        });
+        header.set_size(0);
+        header.set_mode(0o777);
+        // `set_link_name` refuses `..`; write the raw field instead.
+        header.as_old_mut().linkname[..target.len()].copy_from_slice(target.as_bytes());
+        header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_cksum();
+        builder.append(&header, &[][..]).unwrap();
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_size(4);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append_data(&mut header, "d/x", &b"evil"[..]).unwrap();
+    let archive = sandbox.join("links.tar");
+    fs::write(&archive, builder.into_inner().unwrap()).unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    for threads in ["-mmt=1", "-mmt=4"] {
+        // Writing `d/x` under a regular file `d` may fail; what matters is
+        // that nothing is written through a link.
+        let _ = Command::new(exe)
+            .args(["x", archive.to_str().unwrap(), "-o", out_dir.to_str().unwrap(), threads])
+            .output()
+            .unwrap();
+        assert!(!sandbox.join("x").exists(), "{threads}: d/x escaped via symlink");
+        assert!(!sandbox.join("deep").join("x").exists(), "{threads}: escaped");
+        for link in ["d", "h"] {
+            if let Ok(meta) = fs::symlink_metadata(out_dir.join(link)) {
+                assert!(!meta.file_type().is_symlink(), "{threads}: {link} became a symlink");
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&sandbox);
+}
+
+/// Decode a compressed TAR with the standard decoder crates (no OpenArchive
+/// code involved) and return (path, contents) for each regular file.
+fn decode_tar_with_std_crates(path: &str) -> Vec<(String, Vec<u8>)> {
+    use std::io::Read;
+
+    let file = fs::File::open(path).unwrap();
+    let reader: Box<dyn Read> = if path.ends_with(".gz") {
+        Box::new(flate2::read::MultiGzDecoder::new(file))
+    } else {
+        Box::new(bzip2::read::MultiBzDecoder::new(file))
+    };
+    let mut archive = tar::Archive::new(reader);
+    let mut out = Vec::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.header().entry_type().is_file() {
+            let name = entry.path().unwrap().to_string_lossy().replace('\\', "/");
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            out.push((name, data));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Count gzip members by decoding them one at a time.
+fn gzip_member_count(data: &[u8]) -> usize {
+    use std::io::Read;
+
+    let mut rest = data;
+    let mut count = 0;
+    while !rest.is_empty() {
+        let mut decoder = flate2::bufread::GzDecoder::new(rest);
+        std::io::copy(&mut decoder, &mut std::io::sink()).unwrap();
+        let mut remaining = Vec::new();
+        decoder.into_inner().read_to_end(&mut remaining).unwrap();
+        let consumed = rest.len() - remaining.len();
+        assert!(consumed > 0);
+        rest = &rest[consumed..];
+        count += 1;
+    }
+    count
+}
+
+#[test]
+fn test_tar_parallel_compression_roundtrip() {
+    let test_dir = "test_data_tar_parallel";
+    fs::create_dir_all(format!("{}/nested", test_dir)).unwrap();
+
+    // ~6 MB of mixed content: compressible text plus pseudo-random noise,
+    // enough for several gzip chunks and bzip2 streams.
+    let mut text = String::new();
+    for i in 0..60_000 {
+        text.push_str(&format!("line {i}: parallel tar payload {}\n", (i * 7919) % 10_007));
+    }
+    let mut noise = Vec::with_capacity(3 * 1024 * 1024);
+    let mut x: u32 = 0x1234_5678;
+    for _ in 0..noise.capacity() {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        noise.push(x as u8);
+    }
+    fs::write(format!("{}/text.txt", test_dir), &text).unwrap();
+    fs::write(format!("{}/nested/noise.bin", test_dir), &noise).unwrap();
+    fs::write(format!("{}/nested/empty.txt", test_dir), b"").unwrap();
+    for i in 0..50 {
+        fs::write(format!("{}/nested/small_{i}.txt", test_dir), format!("small {i}")).unwrap();
+    }
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    for ext in ["tar.gz", "tar.bz2"] {
+        let mut decoded_by_threads = Vec::new();
+        for threads in ["1", "4"] {
+            let archive = format!("archive_parallel_mmt{}.{}", threads, ext);
+            let created = Command::new(exe)
+                .args(["a", &archive, test_dir, "-mx=6", &format!("-mmt={}", threads)])
+                .status()
+                .unwrap();
+            assert!(created.success(), "failed to create {}", archive);
+
+            let bytes = fs::read(&archive).unwrap();
+            if ext == "tar.gz" {
+                let members = gzip_member_count(&bytes);
+                if threads == "1" {
+                    assert_eq!(members, 1, "-mmt=1 must keep a single gzip member");
+                } else {
+                    assert!(members > 1, "-mmt=4 should produce several members");
+                }
+            } else {
+                assert_eq!(&bytes[..4], b"BZh6");
+            }
+
+            // Standard decoder crates read every member.
+            let decoded = decode_tar_with_std_crates(&archive);
+            let lookup = |name: &str| {
+                decoded
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, d)| d.clone())
+                    .unwrap_or_else(|| panic!("{} missing from {}", name, archive))
+            };
+            assert_eq!(lookup(&format!("{}/text.txt", test_dir)), text.as_bytes());
+            assert_eq!(lookup(&format!("{}/nested/noise.bin", test_dir)), noise);
+            assert!(lookup(&format!("{}/nested/empty.txt", test_dir)).is_empty());
+            assert_eq!(decoded.len(), 53);
+            decoded_by_threads.push(decoded);
+
+            // And OpenArchive's own extraction.
+            let out_dir = format!("out_tar_parallel_mmt{}_{}", threads, ext.replace('.', "_"));
+            let extracted = Command::new(exe)
+                .args(["x", &archive, "-o", &out_dir])
+                .status()
+                .unwrap();
+            assert!(extracted.success(), "failed to extract {}", archive);
+            let base = PathBuf::from(&out_dir).join(test_dir);
+            assert_eq!(fs::read(base.join("nested/noise.bin")).unwrap(), noise);
+            assert_eq!(fs::read_to_string(base.join("text.txt")).unwrap(), text);
+
+            let _ = fs::remove_dir_all(&out_dir);
+            let _ = fs::remove_file(&archive);
+        }
+        assert_eq!(decoded_by_threads[0], decoded_by_threads[1]);
+    }
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
 #[test]
 fn test_tar_large_entries_use_sequential_path() {
     let test_dir = "test_data_tar_large_entries";

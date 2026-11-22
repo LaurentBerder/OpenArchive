@@ -200,11 +200,12 @@ impl ArchiveReader for SevenZHandler {
                 }
             }
 
-            let target_path = if options.flat {
-                let file_name = Path::new(name).file_name().unwrap_or_default();
-                options.output_dir.join(file_name)
-            } else {
-                options.output_dir.join(name)
+            // Unsafe names are reported here; the extraction passes below skip
+            // them silently.
+            let Some(target_path) = file_io::entry_target(&options.output_dir, name, options.flat)
+            else {
+                file_io::warn_unsafe_entry(name);
+                continue;
             };
 
             if f.is_directory() {
@@ -212,7 +213,9 @@ impl ArchiveReader for SevenZHandler {
                     dir_set.insert(target_path);
                 }
             } else if let Some(parent) = target_path.parent() {
-                dir_set.insert(parent.to_path_buf());
+                if !dir_set.contains(parent) {
+                    dir_set.insert(parent.to_path_buf());
+                }
             }
         }
 
@@ -256,11 +259,10 @@ impl ArchiveReader for SevenZHandler {
                 }
 
                 if !entry.is_directory() {
-                    let target_path = if options.flat {
-                        let file_name = Path::new(name).file_name().unwrap_or_default();
-                        options.output_dir.join(file_name)
-                    } else {
-                        options.output_dir.join(name)
+                    let Some(target_path) =
+                        file_io::entry_target(&options.output_dir, name, options.flat)
+                    else {
+                        return Ok(true);
                     };
 
                     file_io::copy_to_file(stream, &target_path, entry.size())?;
@@ -328,11 +330,10 @@ impl ArchiveReader for SevenZHandler {
                     }
 
                     if !entry.is_directory() {
-                        let target_path = if options.flat {
-                            let file_name = Path::new(name).file_name().unwrap_or_default();
-                            options.output_dir.join(file_name)
-                        } else {
-                            options.output_dir.join(name)
+                        let Some(target_path) =
+                            file_io::entry_target(&options.output_dir, name, options.flat)
+                        else {
+                            return Ok(true);
                         };
 
                         const MAX_ASYNC_SIZE: u64 = 8 * 1024 * 1024; // 8 MB threshold for in-memory pipeline
@@ -517,11 +518,10 @@ fn extract_blocks_parallel(
                         }
 
                         if !entry.is_directory() {
-                            let target_path = if options.flat {
-                                let file_name = Path::new(name).file_name().unwrap_or_default();
-                                options.output_dir.join(file_name)
-                            } else {
-                                options.output_dir.join(name)
+                            let Some(target_path) =
+                                file_io::entry_target(&options.output_dir, name, options.flat)
+                            else {
+                                return Ok(true);
                             };
 
                             if entry.size() <= MAX_BUFFERED_ENTRY {

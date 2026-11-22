@@ -148,7 +148,7 @@ impl ArchiveReader for ZipHandler {
 
         let mut entries = Vec::new();
         for i in 0..archive.len() {
-            let file = archive.by_index(i)?;
+            let file = archive.by_index_raw(i)?;
             entries.push(ArchiveEntry {
                 name: file.name().to_string(),
                 size: file.size(),
@@ -174,20 +174,21 @@ impl ArchiveReader for ZipHandler {
         let mut files_to_extract: Vec<(usize, PathBuf, u64)> = Vec::new();
 
         for i in 0..archive.len() {
-            let file = archive.by_index(i)?;
-            let name = file.name().to_string();
+            // Metadata only: `by_index` would also build a decompressor
+            // (and its buffers) for every entry just to read its name.
+            let file = archive.by_index_raw(i)?;
+            let name = file.name();
 
             if let Some(filters) = filter {
-                if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
+                if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
                     continue;
                 }
             }
 
-            let target_path = if options.flat {
-                let file_name = Path::new(&name).file_name().unwrap_or_default();
-                options.output_dir.join(file_name)
-            } else {
-                options.output_dir.join(&name)
+            let Some(target_path) = file_io::entry_target(&options.output_dir, name, options.flat)
+            else {
+                file_io::warn_unsafe_entry(name);
+                continue;
             };
 
             if file.is_dir() {
@@ -196,7 +197,10 @@ impl ArchiveReader for ZipHandler {
                 }
             } else {
                 if let Some(parent) = target_path.parent() {
-                    dirs_to_create.insert(parent.to_path_buf());
+                    // Most files share a parent; only allocate a new key once.
+                    if !dirs_to_create.contains(parent) {
+                        dirs_to_create.insert(parent.to_path_buf());
+                    }
                 }
                 files_to_extract.push((i, target_path, file.size()));
             }

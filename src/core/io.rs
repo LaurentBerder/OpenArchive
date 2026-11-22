@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// Buffer size for large sequential reads and writes. Large enough to keep
 /// syscall overhead low without making per-worker memory noticeable.
@@ -100,9 +100,231 @@ pub(crate) fn write_buffer(path: &Path, data: &[u8]) -> io::Result<()> {
     file.write_all(data)
 }
 
+/// Resolve an archive entry name to its extraction path under `output_dir`.
+///
+/// Returns `None` for names that would escape the output directory ("zip
+/// slip" / "tar slip"): absolute paths, Windows drive or UNC prefixes, a
+/// leading root, or any `..` component. `.` components are dropped. With
+/// `flat`, only the final name component is used. Callers skip such entries
+/// and report them once with [`warn_unsafe_entry`].
+pub(crate) fn entry_target(output_dir: &Path, name: &str, flat: bool) -> Option<PathBuf> {
+    // Archives written on Windows may use '\' even where the host does not
+    // treat it as a separator; normalize so `..\x` is caught everywhere.
+    let normalized;
+    let name = if name.contains('\\') {
+        normalized = name.replace('\\', "/");
+        normalized.as_str()
+    } else {
+        name
+    };
+
+    let mut relative = PathBuf::new();
+    for component in Path::new(name).components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    if flat {
+        let file_name = relative.file_name()?;
+        return Some(output_dir.join(file_name));
+    }
+    Some(output_dir.join(relative))
+}
+
+pub(crate) fn warn_unsafe_entry(name: &str) {
+    eprintln!("Warning: skipping entry outside the output directory: {name}");
+}
+
+/// Size of each block handed from a read-ahead thread to its consumer.
+const READ_AHEAD_BLOCK: usize = 1024 * 1024;
+
+/// Blocks a read-ahead thread may decode before the consumer catches up.
+const READ_AHEAD_DEPTH: usize = 4;
+
+/// Runs a (decompressing) reader on its own thread and hands decoded blocks
+/// to the consumer through a bounded queue. Decompression then overlaps with
+/// whatever the consumer does with the data — parsing TAR headers and
+/// writing files — instead of alternating with it. At most
+/// `READ_AHEAD_DEPTH + 2` blocks are alive at once.
+pub(crate) struct ReadAhead {
+    blocks: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    pos: usize,
+    done: bool,
+}
+
+impl ReadAhead {
+    pub(crate) fn new(mut inner: Box<dyn Read + Send>) -> io::Result<Self> {
+        let (tx, blocks) = std::sync::mpsc::sync_channel(READ_AHEAD_DEPTH);
+        std::thread::Builder::new()
+            .name("openarchive-read-ahead".into())
+            .spawn(move || {
+                loop {
+                    let mut block = vec![0u8; READ_AHEAD_BLOCK];
+                    let mut filled = 0;
+                    let result = loop {
+                        match inner.read(&mut block[filled..]) {
+                            Ok(0) => break Ok(()),
+                            Ok(n) => {
+                                filled += n;
+                                if filled == block.len() {
+                                    break Ok(());
+                                }
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                            Err(e) => break Err(e),
+                        }
+                    };
+                    let eof = result.is_ok() && filled < block.len();
+                    if filled > 0 {
+                        block.truncate(filled);
+                        if tx.send(Ok(block)).is_err() {
+                            return;
+                        }
+                    }
+                    if let Err(e) = result {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                    if eof {
+                        return;
+                    }
+                }
+            })?;
+        Ok(Self {
+            blocks,
+            current: Vec::new(),
+            pos: 0,
+            done: false,
+        })
+    }
+}
+
+impl Read for ReadAhead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while self.pos == self.current.len() {
+            if self.done {
+                return Ok(0);
+            }
+            match self.blocks.recv() {
+                Ok(Ok(block)) => {
+                    self.current = block;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => {
+                    self.done = true;
+                    return Err(e);
+                }
+                // The thread exits after the last block (or an error).
+                Err(_) => {
+                    self.done = true;
+                    return Ok(0);
+                }
+            }
+        }
+        let n = buf.len().min(self.current.len() - self.pos);
+        buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_target_rejects_escaping_names() {
+        let out = Path::new("out");
+        for name in [
+            "../escape.txt",
+            "a/../../escape.txt",
+            "a/..",
+            "..\\escape.txt",
+            "a\\..\\..\\escape.txt",
+            "/etc/passwd",
+            "\\abs.txt",
+            "C:\\Windows\\evil.dll",
+            "C:/evil.txt",
+            "C:evil.txt",
+            "\\\\server\\share\\evil.txt",
+        ] {
+            // Drive letters are prefixes only on Windows; elsewhere `C:` is an
+            // ordinary (odd) directory name that stays inside `out`.
+            if name.starts_with("C:") && !cfg!(windows) {
+                continue;
+            }
+            assert_eq!(entry_target(out, name, false), None, "{name}");
+            if name.ends_with("..") {
+                assert_eq!(entry_target(out, name, true), None, "{name} (flat)");
+            }
+        }
+        // Flat extraction never escapes either, but unsafe names are still
+        // rejected rather than silently renamed.
+        assert_eq!(entry_target(out, "../escape.txt", true), None);
+    }
+
+    #[test]
+    fn entry_target_accepts_normal_names() {
+        let out = Path::new("out");
+        assert_eq!(
+            entry_target(out, "dir/sub/file.txt", false),
+            Some(out.join("dir").join("sub").join("file.txt"))
+        );
+        assert_eq!(
+            entry_target(out, "./dir\\file.txt", false),
+            Some(out.join("dir").join("file.txt"))
+        );
+        assert_eq!(entry_target(out, "dir/", false), Some(out.join("dir")));
+        assert_eq!(
+            entry_target(out, "dir/sub/file.txt", true),
+            Some(out.join("file.txt"))
+        );
+        assert_eq!(entry_target(out, "a..b/c..", false), Some(out.join("a..b").join("c..")));
+    }
+
+    #[test]
+    fn read_ahead_preserves_stream() {
+        let data: Vec<u8> = (0..READ_AHEAD_BLOCK * 3 + 12_345)
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let mut reader = ReadAhead::new(Box::new(io::Cursor::new(data.clone()))).unwrap();
+        let mut out = Vec::new();
+        // Odd-sized reads cross block boundaries.
+        let mut buf = [0u8; 7_777];
+        loop {
+            let n = reader.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn read_ahead_reports_errors() {
+        struct Failing(usize);
+        impl Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(io::Error::other("corrupt stream"));
+                }
+                let n = buf.len().min(self.0);
+                buf[..n].fill(1);
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        let mut reader = ReadAhead::new(Box::new(Failing(10))).unwrap();
+        let mut out = Vec::new();
+        let err = reader.read_to_end(&mut out).unwrap_err();
+        assert!(err.to_string().contains("corrupt stream"));
+        assert_eq!(out, vec![1u8; 10]);
+    }
 
     #[test]
     fn buffer_capacity_is_size_aware() {
