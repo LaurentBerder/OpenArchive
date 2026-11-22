@@ -219,14 +219,7 @@ impl ArchiveReader for ZipHandler {
         }
 
         // 3. Determine parallelism
-        let num_threads = options
-            .threads
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            })
-            .max(1);
+        let num_threads = options.thread_count();
 
         let pass = options.password.as_deref().or(self.password.as_deref());
 
@@ -604,14 +597,7 @@ impl ArchiveWriter for ZipHandler {
             return Ok(());
         }
 
-        let num_threads = options
-            .threads
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            })
-            .max(1);
+        let num_threads = options.thread_count();
 
         let total_size = file_items
             .iter()

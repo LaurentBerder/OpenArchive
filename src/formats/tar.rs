@@ -255,14 +255,7 @@ impl ArchiveReader for TarHandler {
     }
 
     fn extract(&mut self, options: &ExtractOptions, filter: Option<&[String]>) -> Result<()> {
-        let num_threads = options
-            .threads
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            })
-            .max(1);
+        let num_threads = options.thread_count();
 
         if num_threads > 1 && self.try_extract_plain_parallel(options, filter, num_threads)? {
             return Ok(());
@@ -484,11 +477,7 @@ impl TarOutput {
             _ => anyhow::bail!("Invalid tar archive target"),
         };
 
-        let requested = options.threads.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        });
+        let requested = options.thread_count();
         let workers = stream_compress::worker_count(codec, requested);
         if workers > 1 {
             return Ok(Self::Parallel(ParallelCompressor::new(file, codec, workers)?));
@@ -509,10 +498,7 @@ impl TarOutput {
             xz_options.lzma_options.dict_size = dict_size.clamp(DICT_SIZE_MIN, DICT_SIZE_MAX);
         }
 
-        let requested = options
-            .threads
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
-            .max(1);
+        let requested = options.thread_count();
         // Blocks of 3 × the dictionary, as xz itself uses (at least 1 MiB).
         let block_size = (3 * xz_options.lzma_options.dict_size as u64).max(1024 * 1024);
         let workers = xz_worker_count(requested, &xz_options, block_size);

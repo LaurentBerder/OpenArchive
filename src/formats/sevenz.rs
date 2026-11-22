@@ -229,14 +229,7 @@ impl ArchiveReader for SevenZHandler {
             fs::create_dir_all(dir)?;
         }
 
-        let num_threads = options
-            .threads
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            })
-            .max(1);
+        let num_threads = options.thread_count();
 
         let block_count = reader.archive().blocks.len();
         if num_threads > 1 && block_count > 1 && !options.flat {
@@ -868,14 +861,7 @@ fn push_prepared_blocks<W: Write + Seek>(
 impl ArchiveWriter for SevenZHandler {
     fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
         let level = options.level.clamp(0, 9);
-        let num_threads = options
-            .threads
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            })
-            .max(1);
+        let num_threads = options.thread_count();
 
         // Dictionary and match-finder memory can dominate a worker's footprint.
         // Scale the effective thread count before choosing block sizes so high

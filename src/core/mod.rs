@@ -9,6 +9,17 @@ pub mod progress;
 
 pub use progress::{Cancelled, Progress};
 
+/// Logical CPUs available to this process (at least 1).
+pub fn available_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// Threads to use: the requested count (`-mmt`), or every available CPU;
+/// never 0.
+fn resolve_threads(requested: Option<usize>) -> usize {
+    requested.unwrap_or_else(available_threads).max(1)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
     SevenZip,
@@ -92,6 +103,13 @@ pub struct CompressionOptions {
     pub threads: Option<usize>, // Thread count (None = automatic / default)
 }
 
+impl CompressionOptions {
+    /// Threads to compress with: `threads` (`-mmt`), or every CPU.
+    pub fn thread_count(&self) -> usize {
+        resolve_threads(self.threads)
+    }
+}
+
 impl Default for CompressionOptions {
     fn default() -> Self {
         Self {
@@ -115,6 +133,13 @@ pub struct ExtractOptions {
     /// Reports bytes written and lets the caller cancel. On cancellation the
     /// file being written is removed and extraction fails with [`Cancelled`].
     pub progress: Option<Arc<Progress>>,
+}
+
+impl ExtractOptions {
+    /// Threads to extract with: `threads` (`-mmt`), or every CPU.
+    pub fn thread_count(&self) -> usize {
+        resolve_threads(self.threads)
+    }
 }
 
 impl Default for ExtractOptions {
@@ -148,4 +173,21 @@ pub trait ArchiveWriter {
         files: &[PathBuf],
         options: &CompressionOptions,
     ) -> anyhow::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_count_defaults_to_every_cpu_and_is_never_zero() {
+        let extract = |threads| ExtractOptions { threads, ..Default::default() };
+        assert_eq!(extract(None).thread_count(), available_threads());
+        assert_eq!(extract(Some(3)).thread_count(), 3);
+        assert_eq!(extract(Some(0)).thread_count(), 1);
+
+        let compress = |threads| CompressionOptions { threads, ..Default::default() };
+        assert_eq!(compress(None).thread_count(), available_threads());
+        assert_eq!(compress(Some(0)).thread_count(), 1);
+    }
 }
