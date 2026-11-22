@@ -11,9 +11,10 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use walkdir::WalkDir;
 
 use crate::core::io as file_io;
+use crate::core::filter::{self, EntryFilter};
+use crate::core::inputs::{self, Input};
 use crate::core::paths;
 use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions, Progress};
 
@@ -178,7 +179,7 @@ impl ArchiveReader for SevenZHandler {
         Ok(entries)
     }
 
-    fn extract(&mut self, options: &ExtractOptions, filter: Option<&[String]>) -> Result<()> {
+    fn extract(&mut self, options: &ExtractOptions, filter: Option<&EntryFilter>) -> Result<()> {
         let pass = options
             .password
             .as_deref()
@@ -196,7 +197,7 @@ impl ArchiveReader for SevenZHandler {
 
         for f in reader.archive().files.iter() {
             let name = f.name();
-            if !paths::matches_filter(filter, name) {
+            if !filter::selected(filter, name) {
                 continue;
             }
 
@@ -256,7 +257,7 @@ impl ArchiveReader for SevenZHandler {
             reader.for_each_entries(|entry, stream| {
                 let name = entry.name();
 
-                if !paths::matches_filter(filter, name) {
+                if !filter::selected(filter, name) {
                     return Ok(true);
                 }
 
@@ -328,7 +329,7 @@ impl ArchiveReader for SevenZHandler {
                     }
 
                     let name = entry.name();
-                    if !paths::matches_filter(filter, name) {
+                    if !filter::selected(filter, name) {
                         return Ok(true);
                     }
 
@@ -401,7 +402,7 @@ impl ArchiveReader for SevenZHandler {
         Ok(())
     }
 
-    fn test(&mut self, password: Option<&str>, progress: Option<&Progress>) -> Result<()> {
+    fn test(&mut self, password: Option<&str>, filter: Option<&EntryFilter>, progress: Option<&Progress>) -> Result<()> {
         let pass = password
             .or(self.password.as_deref())
             .map(Password::from)
@@ -411,11 +412,18 @@ impl ArchiveReader for SevenZHandler {
             .with_context(|| format!("Failed to open 7z archive: {}", self.path.display()))?;
 
         if let Some(progress) = progress {
-            let total = reader.archive().files.iter().fold(0u64, |acc, f| acc.saturating_add(f.size()));
+            let total = reader
+                .archive()
+                .files
+                .iter()
+                .filter(|f| filter::selected(filter, f.name()))
+                .fold(0u64, |acc, f| acc.saturating_add(f.size()));
             progress.set_total(total);
         }
-        reader.for_each_entries(|_entry, stream| {
-            file_io::drain(stream, progress)?;
+        reader.for_each_entries(|entry, stream| {
+            if filter::selected(filter, entry.name()) {
+                file_io::drain(stream, progress)?;
+            }
             Ok(true)
         })?;
 
@@ -436,7 +444,7 @@ fn extract_blocks_parallel(
     block_count: usize,
     num_threads: usize,
     options: &ExtractOptions,
-    filter: Option<&[String]>,
+    filter: Option<&EntryFilter>,
 ) -> Result<()> {
     let archive = sevenz_rust2::Archive::open_with_password(archive_path, password)
         .with_context(|| format!("Failed to open 7z archive: {}", archive_path.display()))?;
@@ -520,7 +528,7 @@ fn extract_blocks_parallel(
                         }
 
                         let name = entry.name();
-                        if !paths::matches_filter(filter, name) {
+                        if !filter::selected(filter, name) {
                             return Ok(true);
                         }
 
@@ -873,7 +881,7 @@ fn push_prepared_blocks<W: Write + Seek>(
 }
 
 impl ArchiveWriter for SevenZHandler {
-    fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
+    fn create(archive_path: &Path, files: &[Input], options: &CompressionOptions) -> Result<()> {
         let level = options.level.clamp(0, 9);
         let num_threads = options.thread_count();
 
@@ -897,55 +905,12 @@ impl ArchiveWriter for SevenZHandler {
         let mut dir_entries: Vec<SzEntry> = Vec::new();
         let mut file_items: Vec<FileItem> = Vec::new();
 
-        for target in files {
-            let Ok(target_meta) = target.metadata() else {
-                continue;
-            };
-
-            if target_meta.is_dir() {
-                let base = target.parent().unwrap_or(target);
-                for entry in WalkDir::new(target) {
-                    let entry = entry?;
-                    let path = entry.path();
-                    let rel_path = path.strip_prefix(base).unwrap_or(path);
-                    let rel_name = rel_path.to_string_lossy().replace('\\', "/");
-                    let file_type = entry.file_type();
-
-                    if file_type.is_dir() {
-                        dir_entries.push(SzEntry::from_path(path, rel_name));
-                    } else if file_type.is_file() {
-                        let size = entry.metadata()?.len();
-                        file_items.push(FileItem {
-                            entry: SzEntry::from_path(path, rel_name),
-                            path: path.to_path_buf(),
-                            size,
-                        });
-                    } else if file_type.is_symlink() {
-                        // Preserve the previous path-based behavior for
-                        // symlinked files and directories.
-                        if path.is_dir() {
-                            dir_entries.push(SzEntry::from_path(path, rel_name));
-                        } else if path.is_file() {
-                            let size = path.metadata()?.len();
-                            file_items.push(FileItem {
-                                entry: SzEntry::from_path(path, rel_name),
-                                path: path.to_path_buf(),
-                                size,
-                            });
-                        }
-                    }
-                }
-            } else if target_meta.is_file() {
-                let file_name = target
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                file_items.push(FileItem {
-                    entry: SzEntry::from_path(target, file_name),
-                    path: target.clone(),
-                    size: target_meta.len(),
-                });
+        for source in inputs::sources(files)? {
+            let entry = SzEntry::from_path(&source.path, source.name);
+            if source.is_dir {
+                dir_entries.push(entry);
+            } else {
+                file_items.push(FileItem { entry, path: source.path, size: source.metadata.len() });
             }
         }
 

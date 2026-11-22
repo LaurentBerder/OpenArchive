@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::time::Instant;
 use eframe::egui::{self, Color32, FontId, Key, PointerButton, Rect, RichText, Sense, Vec2};
 
-use crate::core::{ArchiveEntry, ArchiveFormat, Conflicts, ExtractOptions, OverwriteMode, Progress};
+use crate::core::{ArchiveEntry, ArchiveFormat, Conflicts, EntryFilter, ExtractOptions, OverwriteMode, Progress};
 use crate::formats::{existing_targets, get_reader, is_cancelled, password_problem};
 
 // ─── Navigation Location ──────────────────────────────────────────────────────
@@ -1272,7 +1272,7 @@ fn perform_archive_op(
             let arc_stem = archive_path.file_stem().unwrap_or_default().to_string_lossy();
             let temp_dir = std::env::temp_dir().join("OpenArchive").join(arc_stem.as_ref());
             fs::create_dir_all(&temp_dir)?;
-            let filter = [full_internal.clone()];
+            let filter = EntryFilter::paths([full_internal.as_str()]);
             // The temp copy of an earlier preview is simply replaced.
             reader.extract(&extract_options(temp_dir.clone(), true, OverwriteMode::Overwrite), Some(&filter))?;
 
@@ -1283,7 +1283,7 @@ fn perform_archive_op(
             Ok(OpOutcome::Previewed(target_file))
         }
         ArchiveOp::ExtractItem { full_internal, is_dir, dest, overwrite, .. } => {
-            let filter = [full_internal.clone()];
+            let filter = EntryFilter::paths([full_internal.as_str()]);
             let options = extract_options(dest.clone(), !is_dir, overwrite.unwrap_or(OverwriteMode::Overwrite));
             if overwrite.is_none() {
                 let existing = existing_targets(archive_path, password.clone(), &options, Some(&filter))?;
@@ -1306,7 +1306,7 @@ fn perform_archive_op(
             Ok(OpOutcome::Done(notes(&options)))
         }
         ArchiveOp::Test => {
-            reader.test(password.as_deref(), Some(&progress))?;
+            reader.test(password.as_deref(), None, Some(&progress))?;
             Ok(OpOutcome::Done(progress.warnings()))
         }
     }

@@ -8,8 +8,11 @@ use std::time::Instant;
 use anyhow::Result;
 
 use openarchive::cli::{CliArgs, Command};
-use openarchive::core::{ArchiveFormat, CompressionOptions, Conflicts, Decision, ExtractOptions, OverwriteMode, Prompter};
-use openarchive::formats::{create_archive, get_reader, is_aborted};
+use openarchive::core::inputs::expand;
+use openarchive::core::{
+    ArchiveFormat, CompressionOptions, Conflicts, Decision, EntryFilter, ExtractOptions, OverwriteMode, Prompter,
+};
+use openarchive::formats::{create_archive_from, get_reader, is_aborted};
 
 /// Asks on the terminal what to do with each existing file, like 7-Zip.
 /// "Always", "Skip all" and "Auto rename all" answer every later question.
@@ -59,6 +62,15 @@ impl Prompter for TerminalPrompter {
     }
 }
 
+/// The entries named on the command line (wildcards allowed), or `None` for
+/// the whole archive.
+fn entry_filter(args: &CliArgs) -> Option<EntryFilter> {
+    if args.files.is_empty() {
+        return None;
+    }
+    Some(EntryFilter::patterns(args.files.iter().map(|f| f.to_string_lossy()), args.recurse))
+}
+
 /// `-aoa` / `-aos` / `-aou` win; otherwise `-y` overwrites; otherwise ask.
 fn conflicts_for(args: &CliArgs) -> Conflicts {
     match (args.overwrite_mode, args.assume_yes) {
@@ -77,6 +89,10 @@ fn print_banner() {
 fn print_help() {
     println!("Usage: openarchive <command> <archive_name> [<file_names>...] [<switches>...]");
     println!();
+    println!("<file_names> may use wildcards: * (any characters) and ? (one character),");
+    println!("e.g. a docs.7z *.txt, or x docs.7z \"notes/*.md\". Without file names,");
+    println!("x, e, l and t apply to the whole archive.");
+    println!();
     println!("<Commands>");
     println!("  gui : Launch OpenArchive GUI File Manager (Default when run without args)");
     println!("  a   : Add files to archive");
@@ -92,7 +108,7 @@ fn print_help() {
     println!("  -md={{size}}   : Set dictionary size (e.g. -md=64m, -md=16m, -md=24)");
     println!("  -ms={{on|off}} : Enable/disable solid compression (-ms=on, -ms=off)");
     println!("  -mmt={{N|on|off}}: Set CPU thread count (-mmt=on, -mmt=1, -mmt=4)");
-    println!("  -r           : Recurse subdirectories");
+    println!("  -r           : Wildcards also match in subfolders (-r- : only at the top)");
     println!("  -y           : Assume Yes on all queries (overwrite existing files)");
     println!("  -ao{{a|s|u}}   : Existing files: a=overwrite all, s=skip, u=rename new files");
     println!();
@@ -132,6 +148,21 @@ fn main() -> Result<()> {
                 process::exit(1);
             }
 
+            let expanded = match expand(&args.files, args.recurse) {
+                Ok(expanded) => expanded,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    process::exit(1);
+                }
+            };
+            for name in &expanded.unmatched {
+                eprintln!("WARNING: No file matches {name}");
+            }
+            if expanded.inputs.is_empty() {
+                eprintln!("Error: Nothing to add.");
+                process::exit(1);
+            }
+
             println!("Creating archive: {}", args.archive.display());
             let options = CompressionOptions {
                 level: args.compression_level,
@@ -151,10 +182,15 @@ fn main() -> Result<()> {
             }
             println!();
 
-            create_archive(&args.archive, &args.files, &options)?;
+            create_archive_from(&args.archive, &expanded.inputs, &options)?;
 
             let meta = fs::metadata(&args.archive)?;
             println!("\nArchive successfully created: {} bytes in {:.2?}", meta.len(), start_time.elapsed());
+            if !expanded.unmatched.is_empty() {
+                // As 7-Zip: the archive is written, but exit code 1 (warning).
+                eprintln!("WARNING: {} name(s) matched no file", expanded.unmatched.len());
+                process::exit(1);
+            }
             println!("Everything is Ok");
         }
 
@@ -173,8 +209,12 @@ fn main() -> Result<()> {
             println!("Physical Size = {}", meta.len());
             println!();
 
+            let filter = entry_filter(&args);
             let mut reader = get_reader(&args.archive, args.password)?;
-            let entries = reader.list()?;
+            let mut entries = reader.list()?;
+            if let Some(filter) = &filter {
+                entries.retain(|entry| filter.matches(&entry.name));
+            }
 
             println!("   Date      Time    Attr         Size   Compressed  Name");
             println!("------------------- ----- ------------ ------------  ------------------------");
@@ -224,8 +264,7 @@ fn main() -> Result<()> {
 
             let mut reader = get_reader(&args.archive, args.password.clone())?;
 
-            let filter_strings: Vec<String> = args.files.iter().map(|p| p.to_string_lossy().to_string()).collect();
-            let filter = if filter_strings.is_empty() { None } else { Some(filter_strings.as_slice()) };
+            let filter = entry_filter(&args);
 
             let conflicts = Arc::new(conflicts_for(&args));
             let extract_opts = ExtractOptions {
@@ -241,7 +280,7 @@ fn main() -> Result<()> {
                 println!("Multithreading: {} threads", th);
             }
 
-            if let Err(err) = reader.extract(&extract_opts, filter) {
+            if let Err(err) = reader.extract(&extract_opts, filter.as_ref()) {
                 if is_aborted(&err) {
                     eprintln!("\nExtraction stopped; files already extracted are kept.");
                     process::exit(255); // 7-Zip's code for "stopped by the user"
@@ -264,7 +303,7 @@ fn main() -> Result<()> {
             println!("Testing archive: {}\n", args.archive.display());
 
             let mut reader = get_reader(&args.archive, args.password.clone())?;
-            reader.test(args.password.as_deref(), None)?;
+            reader.test(args.password.as_deref(), entry_filter(&args).as_ref(), None)?;
 
             println!("\nTesting completed in {:.2?}", start_time.elapsed());
             println!("Everything is Ok");

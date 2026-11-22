@@ -5,11 +5,12 @@ use std::io::{self, BufWriter, Cursor, ErrorKind, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
-use walkdir::WalkDir;
 use zip::write::{FileOptions, SimpleFileOptions};
 use zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::core::io as file_io;
+use crate::core::filter::{self, EntryFilter};
+use crate::core::inputs::{self, Input};
 use crate::core::paths;
 use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions, Progress};
 
@@ -164,7 +165,7 @@ impl ArchiveReader for ZipHandler {
         Ok(entries)
     }
 
-    fn extract(&mut self, options: &ExtractOptions, filter: Option<&[String]>) -> Result<()> {
+    fn extract(&mut self, options: &ExtractOptions, filter: Option<&EntryFilter>) -> Result<()> {
         let file = File::open(&self.path)
             .with_context(|| format!("Failed to open zip archive: {}", self.path.display()))?;
         let mut archive = ZipArchive::new(file)?;
@@ -180,7 +181,7 @@ impl ArchiveReader for ZipHandler {
             let file = archive.by_index_raw(i)?;
             let name = file.name();
 
-            if !paths::matches_filter(filter, name) {
+            if !filter::selected(filter, name) {
                 continue;
             }
 
@@ -309,7 +310,7 @@ impl ArchiveReader for ZipHandler {
         Ok(())
     }
 
-    fn test(&mut self, password: Option<&str>, progress: Option<&Progress>) -> Result<()> {
+    fn test(&mut self, password: Option<&str>, filter: Option<&EntryFilter>, progress: Option<&Progress>) -> Result<()> {
         let file = File::open(&self.path)
             .with_context(|| format!("Failed to open zip archive: {}", self.path.display()))?;
         let mut archive = ZipArchive::new(file)?;
@@ -319,11 +320,17 @@ impl ArchiveReader for ZipHandler {
         if let Some(progress) = progress {
             let mut total = 0u64;
             for i in 0..archive.len() {
-                total = total.saturating_add(archive.by_index_raw(i)?.size());
+                let file = archive.by_index_raw(i)?;
+                if filter::selected(filter, file.name()) {
+                    total = total.saturating_add(file.size());
+                }
             }
             progress.set_total(total);
         }
         for i in 0..archive.len() {
+            if !filter::selected(filter, archive.by_index_raw(i)?.name()) {
+                continue;
+            }
             let mut file = if let Some(p) = pass {
                 archive.by_index_decrypt(i, p.as_bytes())?
             } else {
@@ -499,7 +506,7 @@ fn push_parallel_batches<W: Write + Seek>(
 }
 
 impl ArchiveWriter for ZipHandler {
-    fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
+    fn create(archive_path: &Path, files: &[Input], options: &CompressionOptions) -> Result<()> {
         let file = File::create(archive_path)
             .with_context(|| format!("Failed to create zip file: {}", archive_path.display()))?;
         let buffered = BufWriter::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
@@ -531,62 +538,11 @@ impl ArchiveWriter for ZipHandler {
         let mut dir_entries: Vec<String> = Vec::new();
         let mut file_items: Vec<ZipItem> = Vec::new();
 
-        for target in files {
-            let Ok(target_meta) = target.metadata() else {
-                continue;
-            };
-
-            if target_meta.is_dir() {
-                let base = target.parent().unwrap_or(target);
-                for entry in WalkDir::new(target) {
-                    let entry = entry?;
-                    let path = entry.path();
-                    let rel_path = path.strip_prefix(base).unwrap_or(path);
-                    let rel_name = rel_path.to_string_lossy().replace('\\', "/");
-                    let file_type = entry.file_type();
-
-                    if file_type.is_dir() {
-                        let dir_name = if rel_name.ends_with('/') {
-                            rel_name
-                        } else {
-                            format!("{}/", rel_name)
-                        };
-                        dir_entries.push(dir_name);
-                    } else if file_type.is_file() {
-                        file_items.push(ZipItem {
-                            path: path.to_path_buf(),
-                            name: rel_name,
-                            size: entry.metadata()?.len(),
-                        });
-                    } else if file_type.is_symlink() {
-                        // Preserve path-based handling for symlinked inputs.
-                        if path.is_dir() {
-                            let dir_name = if rel_name.ends_with('/') {
-                                rel_name
-                            } else {
-                                format!("{}/", rel_name)
-                            };
-                            dir_entries.push(dir_name);
-                        } else if path.is_file() {
-                            file_items.push(ZipItem {
-                                path: path.to_path_buf(),
-                                name: rel_name,
-                                size: path.metadata()?.len(),
-                            });
-                        }
-                    }
-                }
-            } else if target_meta.is_file() {
-                let file_name = target
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                file_items.push(ZipItem {
-                    path: target.clone(),
-                    name: file_name,
-                    size: target_meta.len(),
-                });
+        for source in inputs::sources(files)? {
+            if source.is_dir {
+                dir_entries.push(format!("{}/", source.name));
+            } else {
+                file_items.push(ZipItem { path: source.path, name: source.name, size: source.metadata.len() });
             }
         }
 

@@ -124,6 +124,11 @@ Launch the GUI by running `openarchive-gui.exe` (or `openarchive.exe --gui`).
 openarchive <command> <archive> [files...] [switches]
 ```
 
+`files` may use the wildcards `*` (any characters) and `?` (one character), even on Windows,
+where the shell does not expand them. With `a` they pick files to add; with `x`, `e`, `l` and
+`t` they pick entries in the archive (all entries when no name is given). A folder is always
+taken with everything below it.
+
 ### Commands
 
 | Command | Description |
@@ -144,20 +149,27 @@ openarchive <command> <archive> [files...] [switches]
 | `-md={size}` | Set dictionary size in bytes/suffix (e.g. `-md=64m`, `-md=16m`, `-md=24`) |
 | `-ms={on\|off}` | Enable/disable solid compression (e.g. `-ms=on`, `-ms=off`) |
 | `-mmt={N\|on\|off}` | Set CPU thread count for compression and extraction (e.g. `-mmt=on`, `-mmt=4`, `-mmt=1`) |
-| `-r` | Recurse into subdirectories |
-| `-y` | Assume yes to all prompts |
+| `-r` | Wildcards also match in subfolders (e.g. `*.txt -r`); `-r-` matches only at the top |
+| `-y` | Assume yes to all prompts (overwrite existing files) |
+| `-ao{a\|s\|u}` | Existing files: `a` = overwrite, `s` = skip, `u` = keep both (new one renamed) |
 
 ### Examples
 
 ```powershell
 # Create a .7z archive from a folder
-openarchive a backup.7z C:\MyProject -r
+openarchive a backup.7z C:\MyProject
+
+# Add every .rs file in src and its subfolders
+openarchive a sources.7z "src\*.rs" -r
 
 # Create a .zip with maximum compression
 openarchive a photos.zip *.jpg -mx=9
 
 # Extract an archive to a specific folder
 openarchive x archive.7z -oC:\Extracted
+
+# Extract only the .log files, wherever they are in the archive
+openarchive x archive.7z *.log -r -oC:\Logs
 
 # Extract flat (no directory structure)
 openarchive e archive.tar.gz -oC:\Flat

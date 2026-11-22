@@ -1604,3 +1604,105 @@ fn test_overwrite_switches() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Runs the CLI in `dir` and returns (exit code, stdout, stderr).
+fn run_in(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_openarchive")).current_dir(dir).args(args).output().unwrap();
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn wildcard_fixture(name: &str) -> PathBuf {
+    let dir = PathBuf::from(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src/sub")).unwrap();
+    for file in ["src/a.txt", "src/b.log", "src/sub/c.txt", "src/sub/d.log"] {
+        fs::write(dir.join(file), file.as_bytes()).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn test_add_with_wildcards_and_recurse() {
+    let dir = wildcard_fixture("test_wild_add");
+    let root = dir.to_str().unwrap();
+    let extracted = |archive: &str| {
+        let out = format!("{root}/out_{archive}");
+        let (code, _, stderr) = run_in(&dir, &["x", archive, &format!("-oout_{archive}")]);
+        assert_eq!(code, 0, "{stderr}");
+        files_under(&out)
+    };
+
+    // The shell does not expand `*` on Windows, so the CLI does.
+    let (code, _, stderr) = run_in(&dir, &["a", "top.7z", "src/*.txt"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(extracted("top.7z"), ["a.txt"]);
+
+    let (code, _, stderr) = run_in(&dir, &["a", "deep.zip", "src/*.txt", "-r"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(extracted("deep.zip"), ["a.txt", "sub/c.txt"]);
+
+    // Folders are always added in full, as before.
+    let (code, _, stderr) = run_in(&dir, &["a", "all.tar", "src", "-r-"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(extracted("all.tar"), ["src/a.txt", "src/b.log", "src/sub/c.txt", "src/sub/d.log"]);
+
+    // A name that matches nothing: archive still written, warning, exit 1.
+    let (code, _, stderr) = run_in(&dir, &["a", "some.7z", "src/*.log", "src/*.zip", "missing.txt"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("No file matches src/*.zip"), "{stderr}");
+    assert!(stderr.contains("No file matches missing.txt"), "{stderr}");
+    assert_eq!(extracted("some.7z"), ["b.log"]);
+
+    // Nothing at all to add: error, no archive.
+    let (code, _, stderr) = run_in(&dir, &["a", "none.7z", "*.rar"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Nothing to add"), "{stderr}");
+    assert!(!dir.join("none.7z").exists());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_extract_list_and_test_with_wildcards() {
+    let dir = wildcard_fixture("test_wild_extract");
+    let root = dir.to_str().unwrap();
+    let (code, _, stderr) = run_in(&dir, &["a", "arc.7z", "src"]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let extract = |args: &[&str]| {
+        let _ = fs::remove_dir_all(dir.join("out"));
+        let mut all = vec!["x", "arc.7z", "-oout"];
+        all.extend_from_slice(args);
+        let (code, _, stderr) = run_in(&dir, &all);
+        assert_eq!(code, 0, "{args:?}: {stderr}");
+        files_under(&format!("{root}/out"))
+    };
+    assert!(extract(&["*.txt"]).is_empty(), "no .txt at the root of the archive");
+    assert_eq!(extract(&["*.txt", "-r"]), ["src/a.txt", "src/sub/c.txt"]);
+    assert_eq!(extract(&["src/*.log"]), ["src/b.log"]);
+    assert_eq!(extract(&["src/s?b"]), ["src/sub/c.txt", "src/sub/d.log"]);
+    // Plain names are exact paths, even with -r.
+    assert_eq!(extract(&["src/a.txt", "-r"]), ["src/a.txt"]);
+    assert!(extract(&["a.txt", "-r"]).is_empty());
+
+    // `e` flattens what the pattern selects.
+    let _ = fs::remove_dir_all(dir.join("flat"));
+    let (code, _, stderr) = run_in(&dir, &["e", "arc.7z", "-oflat", "*.log", "-r"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(files_under(&format!("{root}/flat")), ["b.log", "d.log"]);
+
+    let (code, stdout, _) = run_in(&dir, &["l", "arc.7z", "*.log", "-r"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("b.log") && stdout.contains("d.log"), "{stdout}");
+    assert!(!stdout.contains("a.txt") && !stdout.contains("c.txt"), "{stdout}");
+    assert!(stdout.contains("2 files, 0 folders"), "{stdout}");
+
+    let (code, _, stderr) = run_in(&dir, &["t", "arc.7z", "*.log", "-r"]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
