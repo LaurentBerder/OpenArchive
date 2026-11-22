@@ -1706,3 +1706,33 @@ fn test_extract_list_and_test_with_wildcards() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_password_problems_are_reported_plainly() {
+    let dir = wildcard_fixture("test_cli_passwords");
+    for archive in ["enc.7z", "enc.zip"] {
+        let (code, _, stderr) = run_in(&dir, &["a", archive, "src", "-psecret"]);
+        assert_eq!(code, 0, "{stderr}");
+
+        for command in ["t", "x"] {
+            let (code, _, stderr) = run_in(&dir, &[command, archive, "-oout"]);
+            assert_eq!(code, 2, "{archive} {command} without password: {stderr}");
+            assert!(stderr.contains("Password required: use -p"), "{archive} {command}: {stderr}");
+
+            let (code, _, stderr) = run_in(&dir, &[command, archive, "-oout", "-pwrong"]);
+            assert_eq!(code, 2, "{archive} {command} wrong password: {stderr}");
+            assert!(stderr.contains("Wrong password"), "{archive} {command}: {stderr}");
+
+            assert!(!stderr.contains("MaybeBadPassword") && !stderr.contains("PasswordRequired"), "{stderr}");
+        }
+        let (code, _, stderr) = run_in(&dir, &["t", archive, "-psecret"]);
+        assert_eq!(code, 0, "{archive} right password: {stderr}");
+    }
+
+    // Other fatal errors keep their message and also exit with 2.
+    let (code, _, stderr) = run_in(&dir, &["t", "missing.7z"]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.starts_with("Error: "), "{stderr}");
+
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -12,7 +12,7 @@ use openarchive::core::inputs::expand;
 use openarchive::core::{
     ArchiveFormat, CompressionOptions, Conflicts, Decision, EntryFilter, ExtractOptions, OverwriteMode, Prompter,
 };
-use openarchive::formats::{create_archive_from, get_reader, is_aborted};
+use openarchive::formats::{PasswordProblem, create_archive_from, get_reader, is_aborted, password_problem};
 
 /// Asks on the terminal what to do with each existing file, like 7-Zip.
 /// "Always", "Skip all" and "Auto rename all" answer every later question.
@@ -115,8 +115,11 @@ fn print_help() {
     println!("Supported Formats: .7z, .zip, .tar, .tar.gz, .tar.bz2, .tar.xz");
 }
 
-fn main() -> Result<()> {
-    let args = match CliArgs::parse_from(env::args()) {
+/// 7-Zip's exit code for a fatal error.
+const EXIT_FATAL: i32 = 2;
+
+fn main() {
+    let mut args = match CliArgs::parse_from(env::args()) {
         Ok(a) => a,
         Err(err) => {
             print_banner();
@@ -125,7 +128,38 @@ fn main() -> Result<()> {
             process::exit(1);
         }
     };
+    args.output_dir = native_separators(args.output_dir);
 
+    if let Err(err) = run(args) {
+        report(&err);
+        process::exit(EXIT_FATAL);
+    }
+}
+
+/// Prints a fatal error: a plain sentence for password problems (the
+/// archive libraries only describe them in debug form), the error and its
+/// causes otherwise.
+fn report(err: &anyhow::Error) {
+    match password_problem(err) {
+        Some(PasswordProblem::Required) => {
+            eprintln!("Error: The archive is encrypted. Password required: use -p{{password}}")
+        }
+        Some(PasswordProblem::Incorrect) => eprintln!("Error: Wrong password"),
+        None => eprintln!("Error: {err:?}"),
+    }
+}
+
+/// `/` as `\` on Windows, so paths in messages are not mixed
+/// (`C:/out\dir\file`).
+fn native_separators(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(path.to_string_lossy().replace('/', "\\"))
+    } else {
+        path
+    }
+}
+
+fn run(args: CliArgs) -> Result<()> {
     let start_time = Instant::now();
 
     match args.command {
