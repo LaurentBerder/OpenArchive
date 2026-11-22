@@ -5,7 +5,7 @@ Issues found during the project review of 2026-11-22. Ordered by priority.
 | ID | Title | Type | Priority | Status |
 |---|---|---|---|---|
 | OA-1 | ~~Path traversal ("zip slip") on extraction~~ | Security bug | Critical | **DONE** |
-| OA-2 | Entry filter matches by substring | Bug | High | TODO |
+| OA-2 | ~~Entry filter matches by substring~~ | Bug | High | **DONE** |
 | OA-3 | GUI cannot open password-protected archives | Bug | High | TODO |
 | OA-4 | GUI swallows extraction errors | Bug | High | TODO |
 | OA-5 | GUI freezes during extraction | Bug | Medium | TODO |
@@ -75,21 +75,31 @@ block-parallel paths).~~
 
 ---
 
-## OA-2 — Entry filter matches by substring
+## ~~OA-2 — Entry filter matches by substring~~ — DONE
 
-**Type:** Bug · **Priority:** High · **Component:** `formats`, `gui` · **Status:** TODO
+**Type:** Bug · **Priority:** High · **Component:** `formats`, `gui` · **Status:** DONE
 
 ### Description
 
-Filters use `name.contains(filter)`. Extracting `a.txt` also extracts `data.txt`,
+~~Filters use `name.contains(filter)`. Extracting `a.txt` also extracts `data.txt`,
 `a.txt.bak`, `x/a.txt/...`. With flat extraction (GUI single-file extract, preview) the extra
-matches overwrite one another or the intended file.
+matches overwrite one another or the intended file.~~
 
-### Suggested fix
+### Resolution
 
-Match exactly, or as a directory prefix: `name == f || name.starts_with(&format!("{f}/"))`,
-after normalizing separators and trailing `/`. If wildcard support is wanted (7-Zip style
-`*.txt`), use a glob matcher explicitly rather than substring.
+- New `core::paths::matches_filter`: a filter selects the entry with exactly that path and,
+  when it names a directory, everything below it (`docs` → `docs`, `docs/`, `docs/a.txt`; not
+  `docs2/…` or `old/docs/…`). `/` and `\` are equivalent; leading `./` or `/` and trailing
+  separators are ignored. Case-sensitive. No filter, or `.` / `/`, selects everything.
+  Allocation-free per entry.
+- All 7 filter sites (zip ×1, tar ×2, 7z ×4) use it, so CLI `x`/`e` and every GUI extract and
+  preview action get the fix.
+- Tests: 4 unit tests in `core::paths`; CLI regression test
+  `test_filter_selects_exact_entries_only` (zip, 7z, tar, tar.gz × 1 and 4 threads × `x` and
+  flat `e`), verified to fail on the old substring matching.
+- Behaviour change: CLI partial names no longer match (`x a.zip readme` used to extract
+  `docs/readme.md`). Wildcards (`*.txt`) are still not supported; consider adding them with
+  `-r` (OA-8).
 
 ---
 
@@ -265,6 +275,10 @@ which is how OA-1 and OA-2 spread everywhere.
 
 Centralize in `core` (`entry_target`, `matches_filter`) and use from all formats.
 
+**Progress:** path computation (OA-1) and filter matching (OA-2) now live in
+`core::paths`. Remaining duplication: the per-format thread-count resolution and the
+directory pre-creation loops.
+
 ---
 
 ## OA-14 — Hardcoded version string in CLI banner
@@ -287,7 +301,8 @@ Use `env!("CARGO_PKG_VERSION")`.
 
 ### Description
 
-31 clippy warnings (collapsible `if`, manual prefix strip, needless refs, manual clamp).
+24 clippy warnings (collapsible `if`, manual prefix strip, needless refs, manual clamp);
+was 31 before OA-2 replaced some of the flagged filter blocks.
 
 ### Suggested fix
 
