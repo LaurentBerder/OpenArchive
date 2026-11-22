@@ -512,15 +512,23 @@ impl OpenArchiveGui {
 
         match &self.current_location {
             NavLocation::Disk(dir) => {
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        let is_dir = path.is_dir();
-                        let is_archive = !is_dir && ArchiveFormat::from_path(&path).is_some();
-                        let size = if is_dir { 0 } else { entry.metadata().map(|m| m.len()).unwrap_or(0) };
-                        self.items.push(DisplayItem { name, is_dir, is_archive, size, compressed_size: None });
+                let entries = match fs::read_dir(dir) {
+                    Ok(entries) => entries,
+                    Err(err) => {
+                        // An unreadable folder must not look like an empty one.
+                        let message = format!("Cannot read {}: {err}", dir.display());
+                        self.status_message = message.clone();
+                        self.show_notification(message);
+                        return;
                     }
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let is_dir = path.is_dir();
+                    let is_archive = !is_dir && ArchiveFormat::from_path(&path).is_some();
+                    let size = if is_dir { 0 } else { entry.metadata().map(|m| m.len()).unwrap_or(0) };
+                    self.items.push(DisplayItem { name, is_dir, is_archive, size, compressed_size: None });
                 }
                 self.status_message = format!("{} items", self.items.len());
                 self.sort_items();
@@ -819,10 +827,15 @@ impl OpenArchiveGui {
                     NavLocation::Disk(dir) => {
                         let source = dir.join(&item.name);
                         if let Some(dest) = rfd::FileDialog::new().pick_folder() {
-                            let target = dest.join(&item.name);
-                            if item.is_dir { let _ = fs::create_dir_all(&target); }
-                            else { let _ = fs::copy(&source, &target); }
-                            self.show_notification(format!("Copied to {}", dest.display()));
+                            match copy_to_folder(&source, &dest) {
+                                Ok(files) => self.show_notification(format!(
+                                    "Copied {} ({files} file{}) to {}",
+                                    item.name,
+                                    if files == 1 { "" } else { "s" },
+                                    dest.display()
+                                )),
+                                Err(err) => self.show_notification(format!("Failed to copy {}: {err}", item.name)),
+                            }
                         }
                     }
                     NavLocation::Archive { archive_path, internal_prefix } => {
@@ -859,6 +872,53 @@ impl OpenArchiveGui {
             self.run_archive_op(arc, ArchiveOp::Test);
         }
     }
+}
+
+/// Copies a file or a whole folder from disk into `dest_dir`, keeping its
+/// name, and returns how many files were copied. Existing files are
+/// overwritten.
+///
+/// Refuses to copy something onto itself (on Unix `fs::copy` would truncate
+/// the file) or a folder into itself (the copy would keep growing the tree
+/// being walked).
+fn copy_to_folder(source: &Path, dest_dir: &Path) -> std::io::Result<usize> {
+    use std::io::{Error, ErrorKind};
+
+    let name = source
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "source has no file name"))?;
+    let source = fs::canonicalize(source)?;
+    fs::create_dir_all(dest_dir)?;
+    let dest_dir = fs::canonicalize(dest_dir)?;
+    let target = dest_dir.join(name);
+
+    if target == source {
+        return Err(Error::new(ErrorKind::InvalidInput, "source and destination are the same"));
+    }
+
+    if !source.is_dir() {
+        fs::copy(&source, &target)?;
+        return Ok(1);
+    }
+
+    if dest_dir.starts_with(&source) {
+        return Err(Error::new(ErrorKind::InvalidInput, "cannot copy a folder into itself"));
+    }
+
+    let mut files = 0;
+    for entry in walkdir::WalkDir::new(&source) {
+        let entry = entry.map_err(Error::other)?;
+        let relative = entry.path().strip_prefix(&source).map_err(Error::other)?;
+        let out = target.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&out)?;
+        } else if entry.path().is_file() {
+            // Includes symlinks to files: their content is copied.
+            fs::copy(entry.path(), &out)?;
+            files += 1;
+        }
+    }
+    Ok(files)
 }
 
 /// Full path of `name` inside an archive, given the folder shown in the GUI.
@@ -1791,5 +1851,82 @@ mod keyboard_tests {
         app.move_focus(true, false);
         assert_eq!(selected(&app), [3]);
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod disk_copy_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("openarchive-copy-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn copies_a_single_file() {
+        let dir = scratch("file");
+        fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let dest = dir.join("dest");
+
+        assert_eq!(copy_to_folder(&dir.join("a.txt"), &dest).unwrap(), 1);
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"hello");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copies_a_folder_recursively() {
+        let dir = scratch("tree");
+        let src = dir.join("src");
+        fs::create_dir_all(src.join("sub/deeper")).unwrap();
+        fs::create_dir_all(src.join("empty")).unwrap();
+        fs::write(src.join("top.txt"), b"1").unwrap();
+        fs::write(src.join("sub/mid.txt"), b"2").unwrap();
+        fs::write(src.join("sub/deeper/low.txt"), b"3").unwrap();
+        let dest = dir.join("dest");
+
+        assert_eq!(copy_to_folder(&src, &dest).unwrap(), 3);
+        assert_eq!(fs::read(dest.join("src/top.txt")).unwrap(), b"1");
+        assert_eq!(fs::read(dest.join("src/sub/mid.txt")).unwrap(), b"2");
+        assert_eq!(fs::read(dest.join("src/sub/deeper/low.txt")).unwrap(), b"3");
+        assert!(dest.join("src/empty").is_dir());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refuses_to_copy_a_file_onto_itself() {
+        let dir = scratch("same");
+        fs::write(dir.join("a.txt"), b"keep me").unwrap();
+
+        let err = copy_to_folder(&dir.join("a.txt"), &dir).unwrap_err();
+        assert!(err.to_string().contains("same"), "{err}");
+        assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"keep me");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refuses_to_copy_a_folder_into_itself() {
+        let dir = scratch("into");
+        let src = dir.join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), b"x").unwrap();
+
+        for dest in [src.clone(), src.join("sub")] {
+            let err = copy_to_folder(&src, &dest).unwrap_err();
+            assert!(err.to_string().contains("itself") || err.to_string().contains("same"), "{err}");
+        }
+        assert!(!src.join("src").exists() && !src.join("sub/src").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_folder_reports_an_error() {
+        let missing = scratch("missing").join("does-not-exist");
+        let app = OpenArchiveGui::with_location(NavLocation::Disk(missing));
+        assert!(app.items.is_empty());
+        assert!(app.status_message.starts_with("Cannot read"), "{}", app.status_message);
+        assert!(app.notification.is_some());
     }
 }
