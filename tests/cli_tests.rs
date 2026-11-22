@@ -587,6 +587,59 @@ fn test_extraction_rejects_path_traversal() {
     let _ = fs::remove_dir_all(&sandbox);
 }
 
+#[test]
+fn test_tar_symlink_entries_are_not_followed() {
+    // `d -> ../..` followed by `d/x`: if extraction created the link, `d/x`
+    // would pass the name check yet land two levels above the output dir.
+    let sandbox = PathBuf::from("symlink_sandbox");
+    let _ = fs::remove_dir_all(&sandbox);
+    let out_dir = sandbox.join("deep").join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, target) in [("d", "../.."), ("h", "../../hard_target")] {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(if name == "d" {
+            tar::EntryType::Symlink
+        } else {
+            tar::EntryType::Link
+        });
+        header.set_size(0);
+        header.set_mode(0o777);
+        // `set_link_name` refuses `..`; write the raw field instead.
+        header.as_old_mut().linkname[..target.len()].copy_from_slice(target.as_bytes());
+        header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_cksum();
+        builder.append(&header, &[][..]).unwrap();
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_size(4);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append_data(&mut header, "d/x", &b"evil"[..]).unwrap();
+    let archive = sandbox.join("links.tar");
+    fs::write(&archive, builder.into_inner().unwrap()).unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    for threads in ["-mmt=1", "-mmt=4"] {
+        // Writing `d/x` under a regular file `d` may fail; what matters is
+        // that nothing is written through a link.
+        let _ = Command::new(exe)
+            .args(["x", archive.to_str().unwrap(), "-o", out_dir.to_str().unwrap(), threads])
+            .output()
+            .unwrap();
+        assert!(!sandbox.join("x").exists(), "{threads}: d/x escaped via symlink");
+        assert!(!sandbox.join("deep").join("x").exists(), "{threads}: escaped");
+        for link in ["d", "h"] {
+            if let Ok(meta) = fs::symlink_metadata(out_dir.join(link)) {
+                assert!(!meta.file_type().is_symlink(), "{threads}: {link} became a symlink");
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&sandbox);
+}
+
 /// Decode a compressed TAR with the standard decoder crates (no OpenArchive
 /// code involved) and return (path, contents) for each regular file.
 fn decode_tar_with_std_crates(path: &str) -> Vec<(String, Vec<u8>)> {
