@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use walkdir::WalkDir;
 
 use crate::core::io as file_io;
+use crate::core::paths;
 use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
 
 const MB: u64 = 1024 * 1024;
@@ -131,7 +132,7 @@ impl Read for LazyFileReader {
         let n = self.reader.as_mut().unwrap().read(buf)?;
         if n == 0 {
             self.end = true;
-            self.reader = None; // Release OS file handle immediately
+            self.reader = None; // Release the OS file handle immediately
         }
         Ok(n)
     }
@@ -194,17 +195,14 @@ impl ArchiveReader for SevenZHandler {
 
         for f in reader.archive().files.iter() {
             let name = f.name();
-            if let Some(filters) = filter {
-                if !filters.is_empty() && !filters.iter().any(|fil| name.contains(fil)) {
-                    continue;
-                }
+            if !paths::matches_filter(filter, name) {
+                continue;
             }
 
-            // Unsafe names are reported here; the extraction passes below skip
-            // them silently.
-            let Some(target_path) = file_io::entry_target(&options.output_dir, name, options.flat)
+            // This pass sees every name first, so an unsafe one refuses the
+            // archive before anything is written.
+            let Some(target_path) = paths::entry_target(&options.output_dir, name, options.flat)?
             else {
-                file_io::warn_unsafe_entry(name);
                 continue;
             };
 
@@ -252,15 +250,13 @@ impl ArchiveReader for SevenZHandler {
             reader.for_each_entries(|entry, stream| {
                 let name = entry.name();
 
-                if let Some(filters) = filter {
-                    if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
-                        return Ok(true);
-                    }
+                if !paths::matches_filter(filter, name) {
+                    return Ok(true);
                 }
 
                 if !entry.is_directory() {
                     let Some(target_path) =
-                        file_io::entry_target(&options.output_dir, name, options.flat)
+                        paths::entry_target(&options.output_dir, name, options.flat)?
                     else {
                         return Ok(true);
                     };
@@ -323,15 +319,13 @@ impl ArchiveReader for SevenZHandler {
                     }
 
                     let name = entry.name();
-                    if let Some(filters) = filter {
-                        if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
-                            return Ok(true);
-                        }
+                    if !paths::matches_filter(filter, name) {
+                        return Ok(true);
                     }
 
                     if !entry.is_directory() {
                         let Some(target_path) =
-                            file_io::entry_target(&options.output_dir, name, options.flat)
+                            paths::entry_target(&options.output_dir, name, options.flat)?
                         else {
                             return Ok(true);
                         };
@@ -511,15 +505,13 @@ fn extract_blocks_parallel(
                         }
 
                         let name = entry.name();
-                        if let Some(filters) = filter {
-                            if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
-                                return Ok(true);
-                            }
+                        if !paths::matches_filter(filter, name) {
+                            return Ok(true);
                         }
 
                         if !entry.is_directory() {
                             let Some(target_path) =
-                                file_io::entry_target(&options.output_dir, name, options.flat)
+                                paths::entry_target(&options.output_dir, name, options.flat)?
                             else {
                                 return Ok(true);
                             };

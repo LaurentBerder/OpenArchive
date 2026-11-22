@@ -589,7 +589,7 @@ Not run in this round. A measurement harness was drafted (wall time, CPU time, a
 
 ### 15.8 Extraction path safety [COMPLETED]
 
-Not a performance item, but found while working on extraction: TAR, ZIP and 7z joined entry names onto the output directory without checks, so `../x`, `a/../../x` or absolute names wrote outside it ("tar slip" / "zip slip"; confirmed with an unpatched build). Every extraction path now resolves names through `core::io::entry_target`. It normalizes `\` to `/`, drops `.`, and rejects `..`, a root, or a drive/UNC prefix; unsafe entries are skipped with a warning. Symlink and hardlink entries are never created as links (they are written as plain files), so a `d -> ../..` link cannot redirect a later `d/x`; a test locks this in.
+Not a performance item, but found while working on extraction: TAR, ZIP and 7z joined entry names onto the output directory without checks, so `../x`, `a/../../x` or absolute names wrote outside it ("tar slip" / "zip slip"; confirmed with an unpatched build). Every extraction path now resolves names through `core::paths::entry_target`. It treats `\` and `/` as separators, drops `.` and leading separators (a rooted name extracts inside the output directory), and rejects `..`, dot/space-only segments, NUL, and on Windows `:` (drive and alternate data stream prefixes). An unsafe entry refuses the whole archive with an error; zip, 7z and indexed plain TAR check every name before writing anything. Symlink and hardlink entries are never created as links (they are written as plain files), so a `d -> ../..` link cannot redirect a later `d/x`; a test locks this in.
 
 ---
 

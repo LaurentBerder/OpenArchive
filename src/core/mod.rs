@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
 pub(crate) mod io;
+pub(crate) mod paths;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {

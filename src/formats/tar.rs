@@ -16,6 +16,7 @@ use walkdir::WalkDir;
 
 use super::stream_compress::{self, Codec, ParallelCompressor};
 use crate::core::io as file_io;
+use crate::core::paths;
 use crate::core::{
     ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions,
 };
@@ -83,14 +84,11 @@ impl TarHandler {
             let entry = entry?;
             let name = entry.path()?.to_string_lossy().to_string();
 
-            if let Some(filters) = filter {
-                if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
-                    continue;
-                }
+            if !paths::matches_filter(filter, &name) {
+                continue;
             }
 
-            let Some(target_path) = file_io::entry_target(&options.output_dir, &name, false) else {
-                file_io::warn_unsafe_entry(&name);
+            let Some(target_path) = paths::entry_target(&options.output_dir, &name, false)? else {
                 continue;
             };
             let entry_type = entry.header().entry_type();
@@ -270,15 +268,12 @@ impl ArchiveReader for TarHandler {
             let mut entry = entry?;
             let name = entry.path()?.to_string_lossy().to_string();
 
-            if let Some(filters) = filter {
-                if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
-                    continue;
-                }
+            if !paths::matches_filter(filter, &name) {
+                continue;
             }
 
-            let Some(target_path) = file_io::entry_target(&options.output_dir, &name, options.flat)
+            let Some(target_path) = paths::entry_target(&options.output_dir, &name, options.flat)?
             else {
-                file_io::warn_unsafe_entry(&name);
                 continue;
             };
 

@@ -37,3 +37,122 @@ pub fn create_archive(archive_path: &Path, files: &[PathBuf], options: &Compress
         }
     }
 }
+
+/// Why an operation failed for lack of a usable password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordProblem {
+    /// The archive is encrypted and no password was given.
+    Required,
+    /// A password was given but it does not decrypt the archive.
+    Incorrect,
+}
+
+/// Classifies an archive error as a password problem, if it is one.
+///
+/// Library errors reach callers wrapped in `anyhow` context or inside
+/// `io::Error`, so the whole chain is searched, including the payload of each
+/// `io::Error` (whose `source()` skips it).
+pub fn password_problem(err: &anyhow::Error) -> Option<PasswordProblem> {
+    err.chain().find_map(classify_password_error)
+}
+
+fn classify_password_error(err: &(dyn std::error::Error + 'static)) -> Option<PasswordProblem> {
+    if let Some(err) = err.downcast_ref::<sevenz_rust2::Error>() {
+        return match err {
+            sevenz_rust2::Error::PasswordRequired => Some(PasswordProblem::Required),
+            sevenz_rust2::Error::MaybeBadPassword(_) => Some(PasswordProblem::Incorrect),
+            _ => None,
+        };
+    }
+    if let Some(err) = err.downcast_ref::<::zip::result::ZipError>() {
+        return match err {
+            ::zip::result::ZipError::InvalidPassword => Some(PasswordProblem::Incorrect),
+            ::zip::result::ZipError::UnsupportedArchive(msg)
+                if *msg == ::zip::result::ZipError::PASSWORD_REQUIRED =>
+            {
+                Some(PasswordProblem::Required)
+            }
+            _ => None,
+        };
+    }
+    if let Some(err) = err.downcast_ref::<std::io::Error>() {
+        return err
+            .get_ref()
+            .and_then(|inner| classify_password_error(inner));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::ExtractOptions;
+    use ::zip::result::ZipError;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("openarchive-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.txt"), vec![b'x'; 10_000]).unwrap();
+        dir
+    }
+
+    #[test]
+    fn classifies_encrypted_7z_errors() {
+        let dir = temp_dir("pwclass");
+        let archive = dir.join("enc.7z");
+        let options = CompressionOptions { password: Some("right".into()), ..Default::default() };
+        create_archive(&archive, &[dir.join("src")], &options).unwrap();
+
+        let list = |pw: Option<&str>| get_reader(&archive, pw.map(String::from)).unwrap().list();
+        let extract = |pw: Option<&str>| {
+            let options = ExtractOptions {
+                output_dir: dir.join("out"),
+                password: pw.map(String::from),
+                ..Default::default()
+            };
+            get_reader(&archive, pw.map(String::from)).unwrap().extract(&options, None)
+        };
+
+        let err = list(None).unwrap_err();
+        assert_eq!(password_problem(&err), Some(PasswordProblem::Required), "{err:#}");
+        let err = list(Some("wrong")).unwrap_err();
+        assert_eq!(password_problem(&err), Some(PasswordProblem::Incorrect), "{err:#}");
+        assert!(list(Some("right")).is_ok());
+
+        let err = extract(None).unwrap_err();
+        assert_eq!(password_problem(&err), Some(PasswordProblem::Required), "{err:#}");
+        let err = extract(Some("wrong")).unwrap_err();
+        assert_eq!(password_problem(&err), Some(PasswordProblem::Incorrect), "{err:#}");
+        extract(Some("right")).unwrap();
+        assert_eq!(std::fs::read(dir.join("out/src/a.txt")).unwrap(), vec![b'x'; 10_000]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classifies_zip_errors_through_wrappers() {
+        let required = || ZipError::UnsupportedArchive(ZipError::PASSWORD_REQUIRED);
+
+        let err = anyhow::Error::new(ZipError::InvalidPassword).context("opening");
+        assert_eq!(password_problem(&err), Some(PasswordProblem::Incorrect));
+
+        let err = anyhow::Error::new(required());
+        assert_eq!(password_problem(&err), Some(PasswordProblem::Required));
+
+        // ZipError converted to io::Error, then wrapped with context.
+        let io: std::io::Error = std::io::Error::other(required());
+        let err = anyhow::Error::new(io).context("worker failed");
+        assert_eq!(password_problem(&err), Some(PasswordProblem::Required));
+    }
+
+    #[test]
+    fn other_errors_are_not_password_problems() {
+        let err = anyhow::Error::new(ZipError::UnsupportedArchive("multi-disk"));
+        assert_eq!(password_problem(&err), None);
+        let err = anyhow::Error::new(sevenz_rust2::Error::ChecksumVerificationFailed);
+        assert_eq!(password_problem(&err), None);
+        let err = anyhow::anyhow!("disk full");
+        assert_eq!(password_problem(&err), None);
+    }
+}

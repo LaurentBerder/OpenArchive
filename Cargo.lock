@@ -2646,6 +2646,7 @@ dependencies = [
  "image",
  "indicatif",
  "lzma-rust2",
+ "memmap2",
  "rfd",
  "sevenz-rust2",
  "tar",
