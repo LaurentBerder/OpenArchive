@@ -131,6 +131,44 @@ mod tests {
     }
 
     #[test]
+    fn classifies_encrypted_zip_errors() {
+        let dir = temp_dir("pwclass-zip");
+        // Two files so `threads: 4` takes the parallel extraction path.
+        std::fs::write(dir.join("src/b.txt"), vec![b'y'; 10_000]).unwrap();
+        let archive = dir.join("enc.zip");
+        let options = CompressionOptions { password: Some("right".into()), ..Default::default() };
+        create_archive(&archive, &[dir.join("src")], &options).unwrap();
+
+        // Zip headers are not encrypted: listing works and flags the entries.
+        let entries = get_reader(&archive, None).unwrap().list().unwrap();
+        assert!(entries.iter().filter(|e| !e.is_dir).all(|e| e.encrypted));
+
+        for threads in [1, 4] {
+            let extract = |pw: Option<&str>| {
+                let options = ExtractOptions {
+                    output_dir: dir.join(format!("out{threads}")),
+                    password: pw.map(String::from),
+                    threads: Some(threads),
+                    ..Default::default()
+                };
+                get_reader(&archive, pw.map(String::from)).unwrap().extract(&options, None)
+            };
+
+            let err = extract(None).unwrap_err();
+            assert_eq!(password_problem(&err), Some(PasswordProblem::Required), "{threads}: {err:#}");
+            let err = extract(Some("wrong")).unwrap_err();
+            assert_eq!(password_problem(&err), Some(PasswordProblem::Incorrect), "{threads}: {err:#}");
+            extract(Some("right")).unwrap();
+            assert_eq!(
+                std::fs::read(dir.join(format!("out{threads}/src/b.txt"))).unwrap(),
+                vec![b'y'; 10_000]
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn classifies_zip_errors_through_wrappers() {
         let required = || ZipError::UnsupportedArchive(ZipError::PASSWORD_REQUIRED);
 
