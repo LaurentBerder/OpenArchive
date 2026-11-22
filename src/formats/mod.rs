@@ -1,6 +1,7 @@
 pub mod sevenz;
 pub mod zip;
 pub mod tar;
+pub(crate) mod stream_compress;
 
 use std::path::{Path, PathBuf};
 use anyhow::Result;
