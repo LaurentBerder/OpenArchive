@@ -1,16 +1,33 @@
-use std::fs::{self, File};
-use std::io::{copy, sink, Read, Write};
-use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
+use bzip2::Compression as BzCompression;
 use bzip2::read::BzDecoder;
 use bzip2::write::BzEncoder;
-use bzip2::Compression as BzCompression;
+use flate2::Compression as GzCompression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression as GzCompression;
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, copy, empty, sink};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tar::Header;
 use walkdir::WalkDir;
 
-use crate::core::{ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
+use crate::core::io as file_io;
+use crate::core::{
+    ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions,
+};
+
+struct TarIndexItem {
+    offset: u64,
+    size: u64,
+    target: PathBuf,
+}
+
+/// Concurrent writes of large files tend to be slower on Windows with
+/// real-time antivirus scanning; large writes are serialized instead.
+const LARGE_TAR_ENTRY_BYTES: u64 = 1024 * 1024;
 
 pub struct TarHandler {
     path: PathBuf,
@@ -26,14 +43,167 @@ impl TarHandler {
     }
 
     fn open_reader(&self) -> Result<Box<dyn Read>> {
-        let file = File::open(&self.path)
+        let file = file_io::open_sequential(&self.path)
             .with_context(|| format!("Failed to open archive: {}", self.path.display()))?;
+        let buf_file = BufReader::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
         match self.format {
-            ArchiveFormat::Tar => Ok(Box::new(file)),
-            ArchiveFormat::TarGz => Ok(Box::new(GzDecoder::new(file))),
-            ArchiveFormat::TarBz2 => Ok(Box::new(BzDecoder::new(file))),
+            ArchiveFormat::Tar => Ok(Box::new(buf_file)),
+            ArchiveFormat::TarGz => Ok(Box::new(GzDecoder::new(buf_file))),
+            ArchiveFormat::TarBz2 => Ok(Box::new(BzDecoder::new(buf_file))),
             _ => anyhow::bail!("Unsupported tar format variant"),
         }
+    }
+
+    /// Extract a plain (uncompressed, seekable) TAR by indexing entry offsets
+    /// first and then copying each entry from an independent file handle.
+    /// Returns false when the archive contains something the parallel path does
+    /// not preserve (links, special entries, duplicate names), so the caller can
+    /// fall back to sequential extraction.
+    fn try_extract_plain_parallel(
+        &self,
+        options: &ExtractOptions,
+        filter: Option<&[String]>,
+        num_threads: usize,
+    ) -> Result<bool> {
+        if self.format != ArchiveFormat::Tar || options.flat {
+            return Ok(false);
+        }
+
+        let file = File::open(&self.path)
+            .with_context(|| format!("Failed to open archive: {}", self.path.display()))?;
+        let mut archive = tar::Archive::new(file);
+
+        let mut dirs: HashSet<PathBuf> = HashSet::new();
+        dirs.insert(options.output_dir.clone());
+        let mut files: Vec<TarIndexItem> = Vec::new();
+        let mut targets: HashSet<PathBuf> = HashSet::new();
+
+        for entry in archive.entries_with_seek()? {
+            let entry = entry?;
+            let name = entry.path()?.to_string_lossy().to_string();
+
+            if let Some(filters) = filter {
+                if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
+                    continue;
+                }
+            }
+
+            let target_path = options.output_dir.join(&name);
+            let entry_type = entry.header().entry_type();
+
+            if entry_type.is_dir() {
+                dirs.insert(target_path);
+            } else if entry_type.is_file() {
+                if let Some(parent) = target_path.parent() {
+                    dirs.insert(parent.to_path_buf());
+                }
+                if !targets.insert(target_path.clone()) {
+                    return Ok(false);
+                }
+                files.push(TarIndexItem {
+                    offset: entry.raw_file_position(),
+                    size: entry.size(),
+                    target: target_path,
+                });
+            } else {
+                return Ok(false);
+            }
+        }
+
+        if files.is_empty() {
+            for dir in &dirs {
+                fs::create_dir_all(dir)?;
+            }
+            return Ok(true);
+        }
+
+        let total_size = files
+            .iter()
+            .fold(0u64, |acc, item| acc.saturating_add(item.size));
+        let average_size = total_size / files.len() as u64;
+
+        for dir in &dirs {
+            fs::create_dir_all(dir)?;
+        }
+
+        if average_size >= LARGE_TAR_ENTRY_BYTES {
+            // Large concurrent writes hurt more than the parallelism helps on
+            // Windows/AV. Reuse the already-open handle and copy sequentially
+            // instead of reopening and rescanning the archive.
+            let mut source = archive.into_inner();
+            for item in &files {
+                source.seek(SeekFrom::Start(item.offset))?;
+                let mut reader = Read::by_ref(&mut source).take(item.size);
+                file_io::copy_to_file(&mut reader, &item.target, item.size)?;
+            }
+            return Ok(true);
+        }
+
+        drop(archive);
+
+        let worker_count = num_threads.min(files.len()).max(1);
+        let next_index = AtomicUsize::new(0);
+        let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let large_write_lock = Mutex::new(());
+        let archive_path = &self.path;
+        let files_ref = &files;
+
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                scope.spawn(|| {
+                    let mut source = match File::open(archive_path) {
+                        Ok(file) => file,
+                        Err(e) => {
+                            let mut guard = first_err.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(e.into());
+                            }
+                            return;
+                        }
+                    };
+
+                    loop {
+                        if first_err.lock().unwrap().is_some() {
+                            break;
+                        }
+
+                        let index = next_index.fetch_add(1, Ordering::Relaxed);
+                        if index >= files_ref.len() {
+                            break;
+                        }
+
+                        let item = &files_ref[index];
+                        let result: Result<()> = (|| {
+                            source.seek(SeekFrom::Start(item.offset))?;
+                            // Serialize large writes; small files still run
+                            // concurrently across workers.
+                            let _large_guard = if item.size >= LARGE_TAR_ENTRY_BYTES {
+                                Some(large_write_lock.lock().unwrap())
+                            } else {
+                                None
+                            };
+                            let mut reader = Read::by_ref(&mut source).take(item.size);
+                            file_io::copy_to_file(&mut reader, &item.target, item.size)?;
+                            Ok(())
+                        })();
+
+                        if let Err(e) = result {
+                            let mut guard = first_err.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(e);
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        if let Some(err) = first_err.into_inner().unwrap() {
+            return Err(err);
+        }
+
+        Ok(true)
     }
 }
 
@@ -64,10 +234,26 @@ impl ArchiveReader for TarHandler {
     }
 
     fn extract(&mut self, options: &ExtractOptions, filter: Option<&[String]>) -> Result<()> {
+        let num_threads = options
+            .threads
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            })
+            .max(1);
+
+        if num_threads > 1 && self.try_extract_plain_parallel(options, filter, num_threads)? {
+            return Ok(());
+        }
+
         let reader = self.open_reader()?;
         let mut archive = tar::Archive::new(reader);
 
         fs::create_dir_all(&options.output_dir)?;
+
+        let mut known_dirs: HashSet<PathBuf> = HashSet::new();
+        known_dirs.insert(options.output_dir.clone());
 
         for entry in archive.entries()? {
             let mut entry = entry?;
@@ -87,15 +273,17 @@ impl ArchiveReader for TarHandler {
             };
 
             if entry.header().entry_type().is_dir() {
-                if !options.flat {
+                if !options.flat && known_dirs.insert(target_path.clone()) {
                     fs::create_dir_all(&target_path)?;
                 }
             } else {
                 if let Some(parent) = target_path.parent() {
-                    fs::create_dir_all(parent)?;
+                    if known_dirs.insert(parent.to_path_buf()) {
+                        fs::create_dir_all(parent)?;
+                    }
                 }
-                let mut out = File::create(&target_path)?;
-                copy(&mut entry, &mut out)?;
+                let size = entry.size();
+                file_io::copy_to_file(&mut entry, &target_path, size)?;
             }
         }
 
@@ -120,19 +308,19 @@ impl ArchiveWriter for TarHandler {
     fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
         let file = File::create(archive_path)
             .with_context(|| format!("Failed to create archive: {}", archive_path.display()))?;
+        let buf_file = BufWriter::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
 
-        let format = ArchiveFormat::from_path(archive_path)
-            .unwrap_or(ArchiveFormat::Tar);
+        let format = ArchiveFormat::from_path(archive_path).unwrap_or(ArchiveFormat::Tar);
 
         let writer: Box<dyn Write> = match format {
-            ArchiveFormat::Tar => Box::new(file),
+            ArchiveFormat::Tar => Box::new(buf_file),
             ArchiveFormat::TarGz => {
                 let level = GzCompression::new(options.level.clamp(0, 9) as u32);
-                Box::new(GzEncoder::new(file, level))
+                Box::new(GzEncoder::new(buf_file, level))
             }
             ArchiveFormat::TarBz2 => {
                 let level = BzCompression::new(options.level.clamp(1, 9) as u32);
-                Box::new(BzEncoder::new(file, level))
+                Box::new(BzEncoder::new(buf_file, level))
             }
             _ => anyhow::bail!("Invalid tar archive target"),
         };
@@ -140,27 +328,77 @@ impl ArchiveWriter for TarHandler {
         let mut builder = tar::Builder::new(writer);
 
         for target in files {
-            if target.is_dir() {
+            let Ok(target_meta) = target.metadata() else {
+                continue;
+            };
+
+            if target_meta.is_dir() {
                 let base = target.parent().unwrap_or(target);
                 for entry in WalkDir::new(target) {
                     let entry = entry?;
                     let path = entry.path();
                     let rel_path = path.strip_prefix(base).unwrap_or(path);
                     let rel_name = rel_path.to_string_lossy().replace('\\', "/");
+                    let file_type = entry.file_type();
 
-                    if path.is_dir() {
-                        builder.append_dir(&rel_name, path)?;
-                    } else if path.is_file() {
-                        builder.append_path_with_name(path, &rel_name)?;
+                    if file_type.is_dir() {
+                        let metadata = entry.metadata()?;
+                        append_tar_dir(&mut builder, &rel_name, &metadata)?;
+                    } else if file_type.is_file() {
+                        append_tar_file(&mut builder, &rel_name, path)?;
+                    } else if file_type.is_symlink() {
+                        if path.is_dir() {
+                            let metadata = path.metadata()?;
+                            append_tar_dir(&mut builder, &rel_name, &metadata)?;
+                        } else if path.is_file() {
+                            append_tar_file(&mut builder, &rel_name, path)?;
+                        }
                     }
                 }
-            } else if target.is_file() {
-                let file_name = target.file_name().unwrap_or_default().to_string_lossy().to_string();
-                builder.append_path_with_name(target, &file_name)?;
+            } else if target_meta.is_file() {
+                let file_name = target
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                append_tar_file(&mut builder, &file_name, target)?;
             }
         }
 
-        builder.finish()?;
+        let mut output = builder.into_inner()?;
+        output.flush()?;
         Ok(())
     }
+}
+
+fn append_tar_file<W: Write>(builder: &mut tar::Builder<W>, name: &str, path: &Path) -> Result<()> {
+    let file = file_io::open_sequential(path)?;
+    // Read metadata from the opened handle so the header size matches the
+    // bytes about to be copied, even if the file changed after traversal.
+    let metadata = file.metadata()?;
+
+    let mut header = Header::new_gnu();
+    header.set_metadata(&metadata);
+
+    if metadata.len() < file_io::SMALL_FILE_THRESHOLD {
+        builder.append_data(&mut header, name, file)?;
+    } else {
+        let mut reader = BufReader::with_capacity(file_io::IO_BUFFER_SIZE, file);
+        builder.append_data(&mut header, name, &mut reader)?;
+    }
+
+    Ok(())
+}
+
+fn append_tar_dir<W: Write>(
+    builder: &mut tar::Builder<W>,
+    name: &str,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    let mut header = Header::new_gnu();
+    header.set_metadata(metadata);
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_size(0);
+    builder.append_data(&mut header, name, empty())?;
+    Ok(())
 }

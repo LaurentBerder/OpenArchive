@@ -171,7 +171,12 @@ fn main() -> Result<()> {
                 flat: is_flat,
                 password: args.password,
                 overwrite: true,
+                threads: args.threads,
             };
+
+            if let Some(th) = extract_opts.threads {
+                println!("Multithreading: {} threads", th);
+            }
 
             reader.extract(&extract_opts, filter)?;
 

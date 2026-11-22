@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- Ignored allocation profiling harness (`tests/alloc_profile.rs`) that reports allocation counts and peak live bytes for archive creation and extraction.
+
+### Changed
+- 7z compression now encodes solid blocks concurrently across `-mmt` worker threads using `sevenz-rust2`'s `prepare_block` / `push_prepared_block`; blocks are appended in archive order from the writer thread.
+- A single oversized 7z block (for example one huge file) uses multi-threaded LZMA2 inside its own stream, with memory bounded by the chunk size.
+- ZIP compression now batches files by uncompressed bytes (and entry count), uses a sliding window to bound the reorder buffer, and spills oversized batches to temporary sub-archives so large files compress in parallel without unbounded RAM.
+- Plain TAR extraction now indexes entry offsets and extracts small-file archives in parallel; large-entry archives stay sequential to avoid concurrent-write regressions under Windows AV. Flat, compressed, linked/special, and duplicate-name archives use the ordered path.
+- TAR creation now writes explicit GNU headers from opened-file metadata and uses the shared sequential/buffered I/O path instead of `tar::Builder::append_path_with_name` / `append_dir`.
+- Windows I/O: traversal uses `DirEntry` file types instead of extra metadata calls; file reads use size-aware 8 KB/256 KB buffers with `FILE_FLAG_SEQUENTIAL_SCAN`; archive writers use 1 MB output buffers; small extracted entries are written directly.
+- 7z compression now caps simultaneous LZMA2 encoders against a 1.5 GiB estimated encoder-memory budget, reducing effective worker count at high levels or large `-md` dictionaries.
+- 7z extraction now decodes independent blocks concurrently on multi-block archives, buffering entries through a 64 MB budget and serializing disk writes on a single writer thread; single-block and flat extraction keep the ordered pipeline.
+- Memory: file copies reuse one 256 KB thread-local buffer instead of allocating per entry; 7z prepared blocks and the 7z extraction queue have explicit 256 MB / 64 MB budgets.
+- Migrated the 7z backend from `sevenz-rust` 0.6 to `sevenz-rust2` 0.25.
+
+### Fixed
+- `-mmt` now changes 7z compression wall-clock time instead of only changing solid-block boundaries.
+- ZIP parallel compression can no longer accumulate an unbounded reorder buffer; in-flight batch data is capped at 256 MB.
+- `-mx=0` now stores 7z entries with the COPY method, matching 7-Zip.
+- `-md` now accepts the 4 GB maximum (`-md=32`, `-md=4g`) instead of silently failing to parse.
+- 7z extraction peak memory is now bounded by a 64 MB queue budget instead of an item count that could scale with thread count and file size.
+- Removed redundant metadata syscalls and per-file 64 KB buffer allocations on small-file archive creation and extraction paths.
+
+---
+
 ## [0.1.0] — 2026-11-05
 
 ### Added
@@ -57,4 +84,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `wix/main.wxs` WiX source for the MSI installer
 - `.gitignore` excluding `target/` and `wix314-tools/`
 
+[Unreleased]: https://github.com/LaurentBerder/OpenArchive/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/LaurentBerder/OpenArchive/releases/tag/v0.1.0

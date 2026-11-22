@@ -141,6 +141,9 @@ openarchive <command> <archive> [files...] [switches]
 | `-o{dir}` | Set output directory (e.g. `-oC:\Output`) |
 | `-p{password}` | Set encryption password (e.g. `-pMySecret`) |
 | `-mx={0..9}` | Compression level: 0 = store, 5 = default, 9 = ultra (e.g. `-mx=9`) |
+| `-md={size}` | Set dictionary size in bytes/suffix (e.g. `-md=64m`, `-md=16m`, `-md=24`) |
+| `-ms={on\|off}` | Enable/disable solid compression (e.g. `-ms=on`, `-ms=off`) |
+| `-mmt={N\|on\|off}` | Set CPU thread count for compression and extraction (e.g. `-mmt=on`, `-mmt=4`, `-mmt=1`) |
 | `-r` | Recurse into subdirectories |
 | `-y` | Assume yes to all prompts |
 
