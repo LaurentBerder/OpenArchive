@@ -59,8 +59,8 @@ Important dependencies identified during source inspection:
 |---|---|
 | 7z | sevenz-rust2 |
 | ZIP | zip |
-| Deflate/GZIP | flate2 |
-| BZIP2 | bzip2 |
+| Deflate/GZIP | flate2 (block-parallel for TAR.GZ) |
+| BZIP2 | bzip2 (block-parallel for TAR.BZ2) |
 | TAR | tar |
 | Directory traversal | walkdir |
 
@@ -109,7 +109,7 @@ The initial inspection found sequential file processing in the archive handlers.
 - 7z compression groups input files into solid blocks and encodes the blocks concurrently with `sevenz-rust2` (`prepare_block` / `push_prepared_block`), appending them in archive order from the writer thread. A single oversized block falls back to multi-threaded LZMA2 inside its own stream.
 - 7z extraction decodes independent blocks concurrently on multi-block archives, using a bounded decode queue and a single serialized writer; single-block and flat archives keep the decode/write pipeline.
 - ZIP compression and extraction use bounded worker pipelines.
-- TAR remains sequential because it is a streaming format; it should not be described as parallel.
+- TAR stream building is sequential, but TAR.GZ/TAR.BZ2 compression is block-parallel (independent gzip members / bzip2 streams, see §15.4), and plain TAR extraction of small-file archives uses parallel workers.
 
 This does not establish that every underlying dependency is multi-threaded; it describes the application-level pipelines.
 
@@ -552,24 +552,44 @@ Oversized ZIP batches now spill to unique temporary sub-archives instead of forc
 - [x] ~~Plain TAR extraction (small-file archives)~~ [COMPLETED]: TAR extraction indexes entry data offsets with `entries_with_seek`, then uses independent file handles and workers for archives whose average entry is below 1 MB. Large-entry archives reuse the already-open handle and copy sequentially; flat extraction, links/special entries, duplicate names, and compressed TAR fall back to the ordered path. This matches the practical 7-Zip behavior: independent uncompressed entries can be extracted in parallel, while large concurrent writes on Windows/AV do not pay off.
   - **Validation:** 782-file / 15.9 MB TAR extracted in 36.9 s vs 55.9 s sequentially in the cleanest run (~1.5×); repeated runs were 1.3–1.6× faster. A 64 × 4 MB large-entry archive stays on the sequential path. Tests cover small files, large files, empty files, long paths, filters, and the compressed formats.
   - **Why the size split:** concurrent creation of many small files benefits from workers; concurrent writes of large files were slower with real-time antivirus scanning.
-- [ ] **TAR.GZ / TAR.BZ2 compression** remains single-threaded (`flate2` / `bzip2`); a pigz-style multi-member gzip implementation or a faster backend is a separate project. Compressed TAR extraction also remains decode-sequential.
+- [x] ~~TAR.GZ / TAR.BZ2 compression~~ [COMPLETED]: `formats::stream_compress::ParallelCompressor` cuts the TAR stream into chunks (1 MiB for gzip, 2 bzip2 blocks for bzip2), compresses each into an independent gzip member / bzip2 stream on a worker pool, and writes them in order. The concatenation is the pigz `-i` / pbzip2 layout and is read by `gzip -d`, `bzip2 -d`, `tar`, 7-Zip, and `flate2::read::MultiGzDecoder` / `bzip2::read::MultiBzDecoder`. `-mmt=1` keeps the previous single-member output. Live chunks are bounded by a permit pool (2 per worker + 1) and the worker count is capped so chunks plus encoder state fit the same 256 MB in-flight budget as 7z/ZIP (bzip2 `-mx=9`: cap 17 workers; gzip: 56).
+  - **Reader fix:** OpenArchive itself used `GzDecoder` / `BzDecoder`, which stop after the first member, so pigz/pbzip2 archives (and now its own parallel output) read as truncated. Listing, testing and extraction now use the multi-member decoders.
+  - **Validation:** unit tests decode across chunk boundaries, empty input, writer-error propagation, and worker-count-independent output; integration tests decode `-mmt=1` and `-mmt=4` archives with `flate2`/`bzip2`/`tar` only, check the gzip member count, and extract with OpenArchive.
+  - **Benchmark** (Ryzen 5 7600 6C/12T, NTFS SSD, warm cache; 21,446-file / 300.3 MB source tree copied from the Cargo registry; minimum of 3 runs; "before" = master `b7457ef` and `-mmt=1`, which matched within noise):
+
+    | Format | Level | Before (1 thread) | 2 | 4 | 8 | 12 threads | Speedup @12 | Size overhead vs 1 thread |
+    |---|---:|---:|---:|---:|---:|---:|---:|---:|
+    | TAR.GZ | 5 (default) | 4.71 s | 1.89 s | 1.31 s | 1.22 s | 1.20 s | 3.9× | +0.31% (63.72 → 63.92 MB) |
+    | TAR.GZ | 9 (max) | 15.38 s | 6.93 s | 3.68 s | 2.16 s | 1.88 s | 8.2× | +0.36% (61.84 → 62.07 MB) |
+    | TAR.BZ2 | 5 (default) | 14.52 s | 7.14 s | 3.73 s | 2.34 s | 2.28 s | 6.4× | +1.25% (47.67 → 48.26 MB) |
+    | TAR.BZ2 | 9 (max) | 15.16 s | 7.48 s | 3.99 s | 2.53 s | 2.32 s | 6.5× | +0.33% (45.93 → 46.08 MB) |
+
+    The 2-thread result beats 2× because TAR building and file reads now overlap with compression on other threads. TAR.GZ `-mx=5` levels off around 1.2 s because walking and reading 21k files becomes the bottleneck.
+  - **bzip2 chunk size trade-off (measured, not adopted):** RLE1 lets one bzip2 block absorb more than `level × 100 kB` of indented source code, so a 2-block chunk often ends in a partial block; that explains the level-5 overhead. 8 blocks per chunk cut it to +0.67% (level 5) and −0.03% (level 9), but at level 9 the memory budget then caps workers at 6, which is slower (3.05 s vs 2.36 s at 12 threads). Shrinking each block slot by 1 kB ("slack") saved only 2.4 KB and was reverted.
+- [x] ~~Compressed TAR extraction~~ [PARTIAL]: a single gzip member or bzip2 stream cannot be decoded in parallel without an index, and member boundaries in multi-member files are not recorded anywhere (scanning for magic bytes is unreliable), so decoding stays sequential. With more than one thread, decoding now runs on a read-ahead thread (`core::io::ReadAhead`, 1 MiB blocks, at most ~6 MiB queued), overlapping it with TAR parsing and file writes. **Not benchmarked** in this round (wrap-up was requested first); expect the gain to show mainly on TAR.BZ2, where decoding is slowest. Parallel decoding of OpenArchive's own multi-member output would need an index (for example a BGZF-style extra field), which would be a format extension. Left for later.
 
 ### 15.5 Deeper Windows I/O
 
 The low-risk wins are implemented: file-type traversal, `FILE_FLAG_SEQUENTIAL_SCAN`, adaptive 8 KB/256 KB buffers, and 1 MB archive output buffers. Further work would need benchmark evidence:
 
-- Overlapped/asynchronous I/O for network or high-latency storage.
-- Memory-mapped reads for very large single files.
-- Larger or batched directory enumeration.
-- Windows-specific copy paths for store-mode archives.
+- Overlapped/asynchronous I/O for network or high-latency storage. **Skipped:** no network or high-latency storage was available to benchmark, and local NTFS showed no I/O-bound case (Priority 3).
+- Memory-mapped reads for very large single files. **Skipped here:** being explored separately (uncommitted mmap experiments on the main checkout); not part of this change.
+- Larger or batched directory enumeration. **Left for later:** after the first (cold, Defender-scanned) pass, creating a TAR.GZ from the 21k-file tree takes 1.2 s in total, so enumeration is not a measured bottleneck. Revisit with a profile on a 100k+ file tree.
+- Windows-specific copy paths for store-mode archives. **Skipped:** archive entries are written into one archive stream, so whole-file copy APIs (`CopyFileEx`) do not apply. Store-mode time is dominated by per-file open/close and AV scanning (Priority 3 measurements).
 
-### 15.6 Micro-allocations
+### 15.6 Micro-allocations [PARTIAL]
 
-The allocation harness still reports thousands of allocations for a few hundred files, mostly path and entry metadata allocations. Path/name pooling or a different entry representation could reduce them, but the small-archive gain is likely modest; the Priority 4 harness makes the effect measurable.
+- [x] ZIP listing and the extraction pre-scan use `by_index_raw` instead of `by_index`. The latter builds a decompressor (inflate state and buffers) for every entry just to read its name and size. It also stops listing and the extraction scan from requiring a password for encrypted entries just to read metadata.
+- [x] ZIP, 7z and TAR extraction check whether the parent directory is already known before allocating a `PathBuf` key (most files share a parent), and the ZIP scan borrows entry names instead of copying them.
+- **Not re-measured** with `tests/alloc_profile.rs` in this round (wrap-up was requested first). The expected saving is roughly one to two allocations per entry from these changes, plus the decoder state the ZIP scan no longer builds. Path/name pooling was not attempted; the remaining allocations are mostly inside the `zip`/`tar` crates' entry representations.
 
-### 15.7 Full benchmark matrix
+### 15.7 Full benchmark matrix [LEFT FOR LATER]
 
-The largest missing piece is still the empirical benchmark: datasets A–E, 7-Zip comparisons, cross-extraction, thread scaling, and memory tables in §13 are all TBD. That data should determine which of the above opportunities matters most for the project goals.
+Not run in this round. A measurement harness was drafted (wall time, CPU time, and peak working set read from the process handle, with 7-Zip and OpenArchive run side by side), but the 7-Zip comparison runs were stopped when wrap-up was requested. Datasets A–E, cross-extraction, thread scaling and the memory tables in §13 remain TBD. The §15.4 TAR.GZ/TAR.BZ2 table above is the only new empirical result. Extracting dataset B (100k+ files) will be dominated by Windows Defender scanning each new file (~30 ms/file observed in Priority 3), so record AV state with every run.
+
+### 15.8 Extraction path safety [COMPLETED]
+
+Not a performance item, but found while working on extraction: TAR, ZIP and 7z joined entry names onto the output directory without checks, so `../x`, `a/../../x` or absolute names wrote outside it ("tar slip" / "zip slip"; confirmed with an unpatched build). Every extraction path now resolves names through `core::io::entry_target`. It normalizes `\` to `/`, drops `.`, and rejects `..`, a root, or a drive/UNC prefix; unsafe entries are skipped with a warning. Symlink and hardlink entries are never created as links (they are written as plain files), so a `d -> ../..` link cannot redirect a later `d/x`; a test locks this in.
 
 ---
 
