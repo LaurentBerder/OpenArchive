@@ -282,6 +282,23 @@ impl OpenArchiveGui {
         self.update_status();
     }
 
+    /// Arrow keys: move one row down or up from the anchor; with `extend`
+    /// (Shift), select the range instead of the single row. Does nothing in
+    /// an empty list.
+    fn move_focus(&mut self, down: bool, extend: bool) {
+        let total = self.items.len();
+        if total == 0 {
+            return;
+        }
+        let current = self.anchor_index.unwrap_or(0).min(total - 1);
+        let target = if down { (current + 1).min(total - 1) } else { current.saturating_sub(1) };
+        if extend {
+            self.select_range_to(target);
+        } else {
+            self.select_single(target);
+        }
+    }
+
     /// Rubber-band drag: select all rows whose rects intersect the drag rectangle.
     fn apply_rubber_band(&mut self, drag_rect: Rect, row_rects: &[(usize, Rect)]) {
         self.selected_indices.clear();
@@ -739,26 +756,11 @@ impl eframe::App for OpenArchiveGui {
             }
 
             // Arrow-key navigation
-            let total = self.items.len();
-            if !total == 0 { return; }
-
             if i.key_pressed(Key::ArrowDown) && !i.modifiers.alt {
-                let anchor = self.anchor_index.unwrap_or(0);
-                let next = (anchor + 1).min(total - 1);
-                if i.modifiers.shift {
-                    self.select_range_to(next);
-                } else {
-                    self.select_single(next);
-                }
+                self.move_focus(true, i.modifiers.shift);
             }
             if i.key_pressed(Key::ArrowUp) && !i.modifiers.alt {
-                let anchor = self.anchor_index.unwrap_or(0);
-                let prev = anchor.saturating_sub(1);
-                if i.modifiers.shift {
-                    self.select_range_to(prev);
-                } else {
-                    self.select_single(prev);
-                }
+                self.move_focus(false, i.modifiers.shift);
             }
 
             // Enter opens the focused (anchor) item
@@ -1422,5 +1424,62 @@ mod listing_tests {
             assert_eq!(names(entries, ""), ["src"]);
             assert_eq!(names(entries, "src/"), ["a.txt"]);
         }
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+
+    fn app_in_dir(tag: &str, files: usize) -> (PathBuf, OpenArchiveGui) {
+        let dir = std::env::temp_dir().join(format!("openarchive-keys-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..files {
+            fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let app = OpenArchiveGui::with_location(NavLocation::Disk(dir.clone()));
+        (dir, app)
+    }
+
+    fn selected(app: &OpenArchiveGui) -> Vec<usize> {
+        let mut indices: Vec<usize> = app.selected_indices.iter().copied().collect();
+        indices.sort_unstable();
+        indices
+    }
+
+    #[test]
+    fn arrows_in_an_empty_list_do_nothing() {
+        let (dir, mut app) = app_in_dir("empty", 0);
+        assert!(app.items.is_empty());
+        for (down, extend) in [(true, false), (false, false), (true, true), (false, true)] {
+            app.move_focus(down, extend);
+        }
+        assert!(app.selected_indices.is_empty());
+        assert_eq!(app.anchor_index, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn arrows_stop_at_both_ends() {
+        let (dir, mut app) = app_in_dir("ends", 3);
+        for _ in 0..5 {
+            app.move_focus(true, false);
+        }
+        assert_eq!(selected(&app), [2]);
+        for _ in 0..5 {
+            app.move_focus(false, false);
+        }
+        assert_eq!(selected(&app), [0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_anchor_is_clamped() {
+        let (dir, mut app) = app_in_dir("stale", 3);
+        app.anchor_index = Some(10); // e.g. the list shrank on refresh
+        app.move_focus(true, false);
+        assert_eq!(selected(&app), [2]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
