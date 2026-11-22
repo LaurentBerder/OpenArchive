@@ -68,6 +68,25 @@ struct PasswordPrompt {
     incorrect: bool,
 }
 
+// ─── Pointer input ────────────────────────────────────────────────────────────
+
+/// How far, in points, the pointer must move after a press before it is a
+/// rubber-band drag rather than a click.
+const RUBBER_BAND_THRESHOLD: f32 = 4.0;
+
+/// One frame of pointer input, as rubber-band selection needs it.
+#[derive(Clone, Copy, Debug, Default)]
+struct PointerFrame {
+    /// Where the primary button went down this frame, if it did.
+    pressed_at: Option<egui::Pos2>,
+    /// The primary button is held.
+    primary_down: bool,
+    /// Current pointer position.
+    hover: Option<egui::Pos2>,
+    /// Ctrl is held: add to the selection instead of replacing it.
+    additive: bool,
+}
+
 // ─── App State ────────────────────────────────────────────────────────────────
 
 pub struct OpenArchiveGui {
@@ -81,10 +100,13 @@ pub struct OpenArchiveGui {
     selected_indices: HashSet<usize>,
     /// The "anchor" index used as the fixed end of a Shift-range.
     anchor_index: Option<usize>,
+    /// The row the keyboard is on: the moving end of a Shift-range. Arrow
+    /// keys move from here, Enter opens it.
+    focus_index: Option<usize>,
 
-    /// True while the user is drag-selecting; tracks the initial pointer position.
+    /// Where the primary button went down inside the list, while it is held.
     drag_select_start: Option<egui::Pos2>,
-    /// Current pointer position during a drag (updated each frame).
+    /// Current pointer position while the button is held.
     drag_select_current: Option<egui::Pos2>,
 
     status_message: String,
@@ -104,29 +126,141 @@ pub struct OpenArchiveGui {
 
 // ─── Platform helpers ─────────────────────────────────────────────────────────
 
-fn open_file_externally(path: &Path) {
+/// Opens `path` with its default program.
+///
+/// Never goes through `cmd.exe`: file names come from archives and may
+/// contain `&`, `|` or `^`, which `cmd /c start` would run as commands.
+fn open_file_externally(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let path_str = path.to_string_lossy().to_string();
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", &path_str])
-            .spawn();
+        shell_open::open(path)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(path)
-            .spawn();
+        std::process::Command::new("xdg-open").arg(path).spawn().map(drop)
     }
 }
 
-fn open_with_dialog(path: &Path) {
+/// Shows the system "Open with" dialog for `path`.
+fn open_with_dialog(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let path_str = path.to_string_lossy().to_string();
-        let _ = std::process::Command::new("rundll32.exe")
-            .args(["shell32.dll,OpenAs_RunDLL", &path_str])
-            .spawn();
+        // rundll32 is started directly (no shell), so the name is not parsed
+        // for commands.
+        std::process::Command::new("rundll32.exe")
+            .arg("shell32.dll,OpenAs_RunDLL")
+            .arg(path)
+            .spawn()
+            .map(drop)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        open_file_externally(path)
+    }
+}
+
+/// `ShellExecuteExW`, the API behind `start`, called directly so the path
+/// is passed as data rather than parsed as a command line.
+#[cfg(target_os = "windows")]
+mod shell_open {
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
+    /// Report failures as errors instead of showing a message box.
+    const SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
+    const SW_SHOWNORMAL: i32 = 1;
+
+    /// `SHELLEXECUTEINFOW` from shellapi.h.
+    #[repr(C)]
+    struct ShellExecuteInfoW {
+        cb_size: u32,
+        f_mask: u32,
+        hwnd: *mut c_void,
+        lp_verb: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show: i32,
+        h_inst_app: *mut c_void,
+        lp_id_list: *mut c_void,
+        lp_class: *const u16,
+        hkey_class: *mut c_void,
+        dw_hot_key: u32,
+        h_icon_or_monitor: *mut c_void,
+        h_process: *mut c_void,
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
+    }
+
+    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    pub(super) fn open(path: &Path) -> io::Result<()> {
+        let verb = wide("open".as_ref());
+        let file = wide(path.as_os_str());
+        let mut info = ShellExecuteInfoW {
+            cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+            f_mask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+            hwnd: std::ptr::null_mut(),
+            lp_verb: verb.as_ptr(),
+            lp_file: file.as_ptr(),
+            lp_parameters: std::ptr::null(),
+            lp_directory: std::ptr::null(),
+            n_show: SW_SHOWNORMAL,
+            h_inst_app: std::ptr::null_mut(),
+            lp_id_list: std::ptr::null_mut(),
+            lp_class: std::ptr::null(),
+            hkey_class: std::ptr::null_mut(),
+            dw_hot_key: 0,
+            h_icon_or_monitor: std::ptr::null_mut(),
+            h_process: std::ptr::null_mut(),
+        };
+        // SAFETY: `info` is a fully initialised SHELLEXECUTEINFOW whose string
+        // pointers reference NUL-terminated buffers that outlive the call.
+        if unsafe { ShellExecuteExW(&mut info) } != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn scratch(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("openarchive-shell-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn struct_matches_the_windows_layout() {
+            // sizeof(SHELLEXECUTEINFOW) on x64 / x86.
+            let expected = if cfg!(target_pointer_width = "64") { 112 } else { 60 };
+            assert_eq!(std::mem::size_of::<ShellExecuteInfoW>(), expected);
+        }
+
+        #[test]
+        fn shell_metacharacters_in_names_are_not_executed() {
+            // Under `cmd /c start`, everything after `&` ran as a command
+            // (OA-25). The file does not exist, so nothing is opened either.
+            let dir = scratch("inject");
+            let marker = dir.join("PWNED_OA");
+            let name = format!("x&md,\"{}\"", marker.display());
+            let err = open(&dir.join(name)).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(2), "{err}"); // ERROR_FILE_NOT_FOUND
+            assert!(!marker.exists(), "shell metacharacters were executed");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 
@@ -147,6 +281,7 @@ impl OpenArchiveGui {
             items: Vec::new(),
             selected_indices: HashSet::new(),
             anchor_index: None,
+            focus_index: None,
             drag_select_start: None,
             drag_select_current: None,
             status_message: "Ready".to_string(),
@@ -241,6 +376,7 @@ impl OpenArchiveGui {
     fn clear_selection(&mut self) {
         self.selected_indices.clear();
         self.anchor_index = None;
+        self.focus_index = None;
         self.drag_select_start = None;
         self.drag_select_current = None;
     }
@@ -248,18 +384,22 @@ impl OpenArchiveGui {
     fn select_all(&mut self) {
         self.selected_indices = (0..self.items.len()).collect();
         self.anchor_index = Some(0);
+        self.focus_index = Some(0);
         self.update_status();
     }
 
-    /// Single-click: set exactly this row as selected (clears others). Updates anchor.
+    /// Single-click: set exactly this row as selected (clears others). Moves
+    /// anchor and focus to it.
     fn select_single(&mut self, idx: usize) {
         self.selected_indices.clear();
         self.selected_indices.insert(idx);
         self.anchor_index = Some(idx);
+        self.focus_index = Some(idx);
         self.update_status();
     }
 
-    /// Ctrl+click: toggle membership of this row. Updates anchor to clicked row.
+    /// Ctrl+click: toggle membership of this row, keeping the rest. Moves
+    /// anchor and focus to it.
     fn select_toggle(&mut self, idx: usize) {
         if self.selected_indices.contains(&idx) {
             self.selected_indices.remove(&idx);
@@ -267,12 +407,16 @@ impl OpenArchiveGui {
             self.selected_indices.insert(idx);
         }
         self.anchor_index = Some(idx);
+        self.focus_index = Some(idx);
         self.update_status();
     }
 
-    /// Shift+click: range from anchor to idx (inclusive). Does not change anchor.
+    /// Shift+click: select the range from the anchor to `idx` (inclusive).
+    /// The anchor stays put; the focus moves to `idx`.
     fn select_range_to(&mut self, idx: usize) {
         let anchor = self.anchor_index.unwrap_or(idx);
+        self.anchor_index = Some(anchor);
+        self.focus_index = Some(idx);
         let lo = anchor.min(idx);
         let hi = anchor.max(idx);
         self.selected_indices.clear();
@@ -282,15 +426,70 @@ impl OpenArchiveGui {
         self.update_status();
     }
 
-    /// Rubber-band drag: select all rows whose rects intersect the drag rectangle.
-    fn apply_rubber_band(&mut self, drag_rect: Rect, row_rects: &[(usize, Rect)]) {
-        self.selected_indices.clear();
+    /// Arrow keys: move the focus one row down or up; with `extend` (Shift),
+    /// select the range from the anchor instead of the single row. Does
+    /// nothing in an empty list.
+    fn move_focus(&mut self, down: bool, extend: bool) {
+        let total = self.items.len();
+        if total == 0 {
+            return;
+        }
+        let current = self.focus_index.or(self.anchor_index).unwrap_or(0).min(total - 1);
+        let target = if down { (current + 1).min(total - 1) } else { current.saturating_sub(1) };
+        if self.anchor_index.is_some_and(|anchor| anchor >= total) {
+            self.anchor_index = Some(current);
+        }
+        if extend {
+            self.select_range_to(target);
+        } else {
+            self.select_single(target);
+        }
+    }
+
+    /// Rubber-band drag: select all rows whose rects intersect the drag
+    /// rectangle. With `additive` (Ctrl held), add them to the current
+    /// selection instead of replacing it.
+    fn apply_rubber_band(&mut self, drag_rect: Rect, row_rects: &[(usize, Rect)], additive: bool) {
+        if !additive {
+            self.selected_indices.clear();
+        }
         for (idx, row_rect) in row_rects {
             if drag_rect.intersects(*row_rect) {
                 self.selected_indices.insert(*idx);
             }
         }
         self.update_status();
+    }
+
+    /// Feeds one frame of pointer input to rubber-band selection.
+    ///
+    /// A press inside `list_area` arms the band; it only becomes a drag once
+    /// the pointer moves [`RUBBER_BAND_THRESHOLD`] away. A plain click never
+    /// becomes a band, so it cannot overwrite what the click (or Ctrl/Shift-
+    /// click) handler selected in the same frame.
+    fn update_rubber_band(&mut self, frame: PointerFrame, list_area: Rect, row_rects: &[(usize, Rect)]) {
+        if let Some(pos) = frame.pressed_at {
+            self.drag_select_start = list_area.contains(pos).then_some(pos);
+            self.drag_select_current = None;
+        }
+        if frame.primary_down {
+            if self.drag_select_start.is_some() {
+                self.drag_select_current = frame.hover;
+            }
+            return;
+        }
+        if let Some(band) = self.rubber_band_rect() {
+            self.apply_rubber_band(band, row_rects, frame.additive);
+        }
+        self.drag_select_start = None;
+        self.drag_select_current = None;
+    }
+
+    /// The rubber band, once the pointer has moved far enough from the press
+    /// to be a drag rather than a click.
+    fn rubber_band_rect(&self) -> Option<Rect> {
+        let (start, end) = (self.drag_select_start?, self.drag_select_current?);
+        (start.distance(end) >= RUBBER_BAND_THRESHOLD).then(|| Rect::from_two_pos(start, end))
     }
 
     fn update_status(&mut self) {
@@ -313,15 +512,23 @@ impl OpenArchiveGui {
 
         match &self.current_location {
             NavLocation::Disk(dir) => {
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        let is_dir = path.is_dir();
-                        let is_archive = !is_dir && ArchiveFormat::from_path(&path).is_some();
-                        let size = if is_dir { 0 } else { entry.metadata().map(|m| m.len()).unwrap_or(0) };
-                        self.items.push(DisplayItem { name, is_dir, is_archive, size, compressed_size: None });
+                let entries = match fs::read_dir(dir) {
+                    Ok(entries) => entries,
+                    Err(err) => {
+                        // An unreadable folder must not look like an empty one.
+                        let message = format!("Cannot read {}: {err}", dir.display());
+                        self.status_message = message.clone();
+                        self.show_notification(message);
+                        return;
                     }
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let is_dir = path.is_dir();
+                    let is_archive = !is_dir && ArchiveFormat::from_path(&path).is_some();
+                    let size = if is_dir { 0 } else { entry.metadata().map(|m| m.len()).unwrap_or(0) };
+                    self.items.push(DisplayItem { name, is_dir, is_archive, size, compressed_size: None });
                 }
                 self.status_message = format!("{} items", self.items.len());
                 self.sort_items();
@@ -429,7 +636,11 @@ impl OpenArchiveGui {
                 if !target_file.exists() {
                     anyhow::bail!("{full_internal} was not found in the archive");
                 }
-                if *open_with { open_with_dialog(&target_file); } else { open_file_externally(&target_file); }
+                if *open_with {
+                    open_with_dialog(&target_file)?;
+                } else {
+                    open_file_externally(&target_file)?;
+                }
                 self.show_notification(format!("Opened {file_name}"));
             }
             ArchiveOp::ExtractItem { full_internal, name, is_dir, dest } => {
@@ -555,8 +766,10 @@ impl OpenArchiveGui {
                         internal_prefix: String::new(),
                     });
                 } else {
-                    open_file_externally(&target);
-                    self.show_notification(format!("Opening {}", item.name));
+                    match open_file_externally(&target) {
+                        Ok(()) => self.show_notification(format!("Opening {}", item.name)),
+                        Err(err) => self.show_notification(format!("Failed to open {}: {err}", item.name)),
+                    }
                 }
             }
             NavLocation::Archive { archive_path, internal_prefix } => {
@@ -598,7 +811,11 @@ impl OpenArchiveGui {
             ContextAction::Open(item) => { self.open_item(item); }
             ContextAction::OpenWith(item) => {
                 match &self.current_location {
-                    NavLocation::Disk(dir) => { open_with_dialog(&dir.join(&item.name)); }
+                    NavLocation::Disk(dir) => {
+                        if let Err(err) = open_with_dialog(&dir.join(&item.name)) {
+                            self.show_notification(format!("Failed to open {}: {err}", item.name));
+                        }
+                    }
                     NavLocation::Archive { archive_path, internal_prefix } => {
                         let (arc, prefix) = (archive_path.clone(), internal_prefix.clone());
                         self.preview_archive_item(arc, &prefix, &item, true);
@@ -610,10 +827,15 @@ impl OpenArchiveGui {
                     NavLocation::Disk(dir) => {
                         let source = dir.join(&item.name);
                         if let Some(dest) = rfd::FileDialog::new().pick_folder() {
-                            let target = dest.join(&item.name);
-                            if item.is_dir { let _ = fs::create_dir_all(&target); }
-                            else { let _ = fs::copy(&source, &target); }
-                            self.show_notification(format!("Copied to {}", dest.display()));
+                            match copy_to_folder(&source, &dest) {
+                                Ok(files) => self.show_notification(format!(
+                                    "Copied {} ({files} file{}) to {}",
+                                    item.name,
+                                    if files == 1 { "" } else { "s" },
+                                    dest.display()
+                                )),
+                                Err(err) => self.show_notification(format!("Failed to copy {}: {err}", item.name)),
+                            }
                         }
                     }
                     NavLocation::Archive { archive_path, internal_prefix } => {
@@ -650,6 +872,53 @@ impl OpenArchiveGui {
             self.run_archive_op(arc, ArchiveOp::Test);
         }
     }
+}
+
+/// Copies a file or a whole folder from disk into `dest_dir`, keeping its
+/// name, and returns how many files were copied. Existing files are
+/// overwritten.
+///
+/// Refuses to copy something onto itself (on Unix `fs::copy` would truncate
+/// the file) or a folder into itself (the copy would keep growing the tree
+/// being walked).
+fn copy_to_folder(source: &Path, dest_dir: &Path) -> std::io::Result<usize> {
+    use std::io::{Error, ErrorKind};
+
+    let name = source
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "source has no file name"))?;
+    let source = fs::canonicalize(source)?;
+    fs::create_dir_all(dest_dir)?;
+    let dest_dir = fs::canonicalize(dest_dir)?;
+    let target = dest_dir.join(name);
+
+    if target == source {
+        return Err(Error::new(ErrorKind::InvalidInput, "source and destination are the same"));
+    }
+
+    if !source.is_dir() {
+        fs::copy(&source, &target)?;
+        return Ok(1);
+    }
+
+    if dest_dir.starts_with(&source) {
+        return Err(Error::new(ErrorKind::InvalidInput, "cannot copy a folder into itself"));
+    }
+
+    let mut files = 0;
+    for entry in walkdir::WalkDir::new(&source) {
+        let entry = entry.map_err(Error::other)?;
+        let relative = entry.path().strip_prefix(&source).map_err(Error::other)?;
+        let out = target.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&out)?;
+        } else if entry.path().is_file() {
+            // Includes symlinks to files: their content is copied.
+            fs::copy(entry.path(), &out)?;
+            files += 1;
+        }
+    }
+    Ok(files)
 }
 
 /// Full path of `name` inside an archive, given the folder shown in the GUI.
@@ -739,35 +1008,18 @@ impl eframe::App for OpenArchiveGui {
             }
 
             // Arrow-key navigation
-            let total = self.items.len();
-            if !total == 0 { return; }
-
             if i.key_pressed(Key::ArrowDown) && !i.modifiers.alt {
-                let anchor = self.anchor_index.unwrap_or(0);
-                let next = (anchor + 1).min(total - 1);
-                if i.modifiers.shift {
-                    self.select_range_to(next);
-                } else {
-                    self.select_single(next);
-                }
+                self.move_focus(true, i.modifiers.shift);
             }
             if i.key_pressed(Key::ArrowUp) && !i.modifiers.alt {
-                let anchor = self.anchor_index.unwrap_or(0);
-                let prev = anchor.saturating_sub(1);
-                if i.modifiers.shift {
-                    self.select_range_to(prev);
-                } else {
-                    self.select_single(prev);
-                }
+                self.move_focus(false, i.modifiers.shift);
             }
 
-            // Enter opens the focused (anchor) item
-            if i.key_pressed(Key::Enter) {
-                if let Some(idx) = self.anchor_index {
-                    if let Some(item) = self.items.get(idx) {
-                        to_open = Some(item.clone());
-                    }
-                }
+            // Enter opens the focused item
+            if i.key_pressed(Key::Enter)
+                && let Some(item) = self.focus_index.or(self.anchor_index).and_then(|idx| self.items.get(idx))
+            {
+                to_open = Some(item.clone());
             }
 
             // Escape clears selection
@@ -1040,48 +1292,32 @@ impl eframe::App for OpenArchiveGui {
                 }
 
                 // ── Rubber-band drag selection ─────────────────────────────────
-                // Detect drag starting on empty space (not on a row)
-                let panel_resp = ui.allocate_response(
-                    Vec2::new(available_w, 0.0), // zero-height, just for input
-                    Sense::drag(),
-                );
-
-                ctx.input(|i| {
-                    // Start drag only when primary button goes down and no item was clicked
-                    if i.pointer.primary_pressed() && click_info.is_none() {
-                        if let Some(pos) = i.pointer.press_origin() {
-                            self.drag_select_start = Some(pos);
-                        }
-                    }
-                    if i.pointer.primary_down() {
-                        if self.drag_select_start.is_some() {
-                            self.drag_select_current = i.pointer.hover_pos();
-                        }
-                    }
-                    if !i.pointer.primary_down() {
-                        // Drag released: apply and clear
-                        if let (Some(start), Some(end)) = (self.drag_select_start, self.drag_select_current) {
-                            let drag_rect = Rect::from_two_pos(start, end);
-                            self.apply_rubber_band(drag_rect, &row_rects);
-                        }
-                        self.drag_select_start = None;
-                        self.drag_select_current = None;
-                    }
+                // Presses in an open dialog must not start a band behind it.
+                let dialog_open = self.password_prompt.is_some() || self.properties_item.is_some();
+                let frame = ctx.input(|i| PointerFrame {
+                    pressed_at: if i.pointer.primary_pressed() && !dialog_open {
+                        i.pointer.press_origin()
+                    } else {
+                        None
+                    },
+                    primary_down: i.pointer.primary_down(),
+                    hover: i.pointer.hover_pos(),
+                    additive: i.modifiers.ctrl,
                 });
+                // The visible part of the list: presses on the toolbar or
+                // address bar do not start a band.
+                let list_area = ui.clip_rect();
+                self.update_rubber_band(frame, list_area, &row_rects);
 
-                // Draw rubber-band rectangle
-                if let (Some(start), Some(end)) = (self.drag_select_start, self.drag_select_current) {
-                    let drag_rect = Rect::from_two_pos(start, end);
+                // Draw the band once it is a drag, not a click.
+                if let Some(band) = self.rubber_band_rect() {
                     ui.painter().rect(
-                        drag_rect,
+                        band,
                         0.0,
                         Color32::from_rgba_unmultiplied(60, 120, 220, 25),
                         egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 120, 220)),
                     );
                 }
-
-                // Drop panel_resp to suppress unused warning
-                drop(panel_resp);
 
                 // Apply deferred open / action
                 if let Some(item) = to_open {
@@ -1422,5 +1658,275 @@ mod listing_tests {
             assert_eq!(names(entries, ""), ["src"]);
             assert_eq!(names(entries, "src/"), ["a.txt"]);
         }
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+
+    fn app_in_dir(tag: &str, files: usize) -> (PathBuf, OpenArchiveGui) {
+        let dir = std::env::temp_dir().join(format!("openarchive-keys-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..files {
+            fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let app = OpenArchiveGui::with_location(NavLocation::Disk(dir.clone()));
+        (dir, app)
+    }
+
+    fn selected(app: &OpenArchiveGui) -> Vec<usize> {
+        let mut indices: Vec<usize> = app.selected_indices.iter().copied().collect();
+        indices.sort_unstable();
+        indices
+    }
+
+    #[test]
+    fn arrows_in_an_empty_list_do_nothing() {
+        let (dir, mut app) = app_in_dir("empty", 0);
+        assert!(app.items.is_empty());
+        for (down, extend) in [(true, false), (false, false), (true, true), (false, true)] {
+            app.move_focus(down, extend);
+        }
+        assert!(app.selected_indices.is_empty());
+        assert_eq!(app.anchor_index, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn arrows_stop_at_both_ends() {
+        let (dir, mut app) = app_in_dir("ends", 3);
+        for _ in 0..5 {
+            app.move_focus(true, false);
+        }
+        assert_eq!(selected(&app), [2]);
+        for _ in 0..5 {
+            app.move_focus(false, false);
+        }
+        assert_eq!(selected(&app), [0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_anchor_is_clamped() {
+        let (dir, mut app) = app_in_dir("stale", 3);
+        app.anchor_index = Some(10); // e.g. the list shrank on refresh
+        app.move_focus(true, false);
+        assert_eq!(selected(&app), [2]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Mouse selection (OA-24) ──────────────────────────────────────────────
+    //
+    // These replay the per-frame order of `update()`: on the release frame the
+    // row click handler runs first, then `update_rubber_band`.
+
+    const ROW_H: f32 = 24.0;
+    const LIST_TOP: f32 = 100.0;
+
+    fn row_rects(rows: usize) -> Vec<(usize, Rect)> {
+        (0..rows)
+            .map(|i| {
+                let top = LIST_TOP + ROW_H * i as f32;
+                (i, Rect::from_min_size(egui::pos2(0.0, top), Vec2::new(300.0, ROW_H)))
+            })
+            .collect()
+    }
+
+    fn list_area() -> Rect {
+        Rect::from_min_max(egui::pos2(0.0, LIST_TOP - 30.0), egui::pos2(300.0, 600.0))
+    }
+
+    fn row_center(i: usize) -> egui::Pos2 {
+        egui::pos2(150.0, LIST_TOP + ROW_H * i as f32 + ROW_H / 2.0)
+    }
+
+    /// A click on row `idx`: press, then release with a 1 px jitter, with the
+    /// click handler (`on_click`) running on the release frame first.
+    fn click(app: &mut OpenArchiveGui, rows: &[(usize, Rect)], idx: usize, ctrl: bool, on_click: fn(&mut OpenArchiveGui, usize)) {
+        let at = row_center(idx);
+        let jitter = at + Vec2::new(1.0, 0.0);
+        app.update_rubber_band(
+            PointerFrame { pressed_at: Some(at), primary_down: true, hover: Some(at), additive: ctrl },
+            list_area(),
+            rows,
+        );
+        app.update_rubber_band(
+            PointerFrame { pressed_at: None, primary_down: true, hover: Some(jitter), additive: ctrl },
+            list_area(),
+            rows,
+        );
+        on_click(app, idx);
+        app.update_rubber_band(
+            PointerFrame { pressed_at: None, primary_down: false, hover: Some(jitter), additive: ctrl },
+            list_area(),
+            rows,
+        );
+    }
+
+    /// A drag from `from` to `to`, released at `to`.
+    fn drag(app: &mut OpenArchiveGui, rows: &[(usize, Rect)], from: egui::Pos2, to: egui::Pos2, ctrl: bool) {
+        app.update_rubber_band(
+            PointerFrame { pressed_at: Some(from), primary_down: true, hover: Some(from), additive: ctrl },
+            list_area(),
+            rows,
+        );
+        app.update_rubber_band(
+            PointerFrame { pressed_at: None, primary_down: true, hover: Some(to), additive: ctrl },
+            list_area(),
+            rows,
+        );
+        app.update_rubber_band(
+            PointerFrame { pressed_at: None, primary_down: false, hover: Some(to), additive: ctrl },
+            list_area(),
+            rows,
+        );
+    }
+
+    #[test]
+    fn ctrl_click_adds_to_and_removes_from_selection() {
+        let (dir, mut app) = app_in_dir("ctrl", 5);
+        let rows = row_rects(5);
+        click(&mut app, &rows, 0, false, OpenArchiveGui::select_single);
+        click(&mut app, &rows, 2, true, OpenArchiveGui::select_toggle);
+        click(&mut app, &rows, 4, true, OpenArchiveGui::select_toggle);
+        assert_eq!(selected(&app), [0, 2, 4]);
+        click(&mut app, &rows, 2, true, OpenArchiveGui::select_toggle);
+        assert_eq!(selected(&app), [0, 4]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shift_click_selects_from_anchor_to_clicked_row() {
+        let (dir, mut app) = app_in_dir("shift", 5);
+        let rows = row_rects(5);
+        click(&mut app, &rows, 1, false, OpenArchiveGui::select_single);
+        click(&mut app, &rows, 3, false, OpenArchiveGui::select_range_to);
+        assert_eq!(selected(&app), [1, 2, 3]);
+        // The anchor stays on row 1, so Shift-clicking above it flips the range.
+        click(&mut app, &rows, 0, false, OpenArchiveGui::select_range_to);
+        assert_eq!(selected(&app), [0, 1]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drag_selects_rows_and_ctrl_drag_adds() {
+        let (dir, mut app) = app_in_dir("drag", 6);
+        let rows = row_rects(6);
+        drag(&mut app, &rows, row_center(0), row_center(2), false);
+        assert_eq!(selected(&app), [0, 1, 2]);
+
+        // A plain drag replaces the selection...
+        drag(&mut app, &rows, row_center(4), row_center(5), false);
+        assert_eq!(selected(&app), [4, 5]);
+        // ...a Ctrl-drag adds to it.
+        drag(&mut app, &rows, row_center(0), row_center(1), true);
+        assert_eq!(selected(&app), [0, 1, 4, 5]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn press_outside_the_list_does_not_start_a_band() {
+        let (dir, mut app) = app_in_dir("outside", 3);
+        let rows = row_rects(3);
+        click(&mut app, &rows, 1, false, OpenArchiveGui::select_single);
+        // Press on the toolbar, drag down across the rows.
+        drag(&mut app, &rows, egui::pos2(150.0, 10.0), row_center(2), false);
+        assert_eq!(selected(&app), [1]);
+        assert!(app.rubber_band_rect().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shift_arrows_extend_from_the_anchor() {
+        let (dir, mut app) = app_in_dir("shiftarrows", 6);
+        app.select_single(1);
+        app.move_focus(true, true);
+        app.move_focus(true, true);
+        assert_eq!(selected(&app), [1, 2, 3]);
+        app.move_focus(false, true);
+        assert_eq!(selected(&app), [1, 2]);
+        // Plain arrow collapses to the focused row and moves on from it.
+        app.move_focus(true, false);
+        assert_eq!(selected(&app), [3]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod disk_copy_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("openarchive-copy-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn copies_a_single_file() {
+        let dir = scratch("file");
+        fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let dest = dir.join("dest");
+
+        assert_eq!(copy_to_folder(&dir.join("a.txt"), &dest).unwrap(), 1);
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"hello");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copies_a_folder_recursively() {
+        let dir = scratch("tree");
+        let src = dir.join("src");
+        fs::create_dir_all(src.join("sub/deeper")).unwrap();
+        fs::create_dir_all(src.join("empty")).unwrap();
+        fs::write(src.join("top.txt"), b"1").unwrap();
+        fs::write(src.join("sub/mid.txt"), b"2").unwrap();
+        fs::write(src.join("sub/deeper/low.txt"), b"3").unwrap();
+        let dest = dir.join("dest");
+
+        assert_eq!(copy_to_folder(&src, &dest).unwrap(), 3);
+        assert_eq!(fs::read(dest.join("src/top.txt")).unwrap(), b"1");
+        assert_eq!(fs::read(dest.join("src/sub/mid.txt")).unwrap(), b"2");
+        assert_eq!(fs::read(dest.join("src/sub/deeper/low.txt")).unwrap(), b"3");
+        assert!(dest.join("src/empty").is_dir());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refuses_to_copy_a_file_onto_itself() {
+        let dir = scratch("same");
+        fs::write(dir.join("a.txt"), b"keep me").unwrap();
+
+        let err = copy_to_folder(&dir.join("a.txt"), &dir).unwrap_err();
+        assert!(err.to_string().contains("same"), "{err}");
+        assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"keep me");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refuses_to_copy_a_folder_into_itself() {
+        let dir = scratch("into");
+        let src = dir.join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), b"x").unwrap();
+
+        for dest in [src.clone(), src.join("sub")] {
+            let err = copy_to_folder(&src, &dest).unwrap_err();
+            assert!(err.to_string().contains("itself") || err.to_string().contains("same"), "{err}");
+        }
+        assert!(!src.join("src").exists() && !src.join("sub/src").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_folder_reports_an_error() {
+        let missing = scratch("missing").join("does-not-exist");
+        let app = OpenArchiveGui::with_location(NavLocation::Disk(missing));
+        assert!(app.items.is_empty());
+        assert!(app.status_message.starts_with("Cannot read"), "{}", app.status_message);
+        assert!(app.notification.is_some());
     }
 }
