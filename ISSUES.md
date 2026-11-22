@@ -6,8 +6,8 @@ Issues found during the project review of 2026-11-22. Ordered by priority.
 |---|---|---|---|---|
 | OA-1 | ~~Path traversal ("zip slip") on extraction~~ | Security bug | Critical | **DONE** |
 | OA-2 | ~~Entry filter matches by substring~~ | Bug | High | **DONE** |
-| OA-3 | GUI cannot open password-protected archives | Bug | High | TODO |
-| OA-4 | GUI swallows extraction errors | Bug | High | TODO |
+| OA-3 | ~~GUI cannot open password-protected archives~~ | Bug | High | **DONE** |
+| OA-4 | GUI swallows extraction errors | Bug | High | IN PROGRESS |
 | OA-5 | GUI freezes during extraction | Bug | Medium | TODO |
 | OA-6 | GUI "Extract" of an on-disk folder copies nothing | Bug | Medium | TODO |
 | OA-7 | Tar links are extracted as empty regular files | Bug | Medium | TODO |
@@ -21,6 +21,12 @@ Issues found during the project review of 2026-11-22. Ordered by priority.
 | OA-15 | Clippy warnings | Tech debt | Low | TODO |
 | OA-16 | Add `.tar.xz` / `.txz` support | Feature | Low | TODO |
 | OA-17 | Clean up untracked mmap benchmark artifacts | Chore | Low | TODO |
+| OA-18 | `a x.zip -p…` silently creates an unencrypted zip | Security bug | Critical | TODO |
+| OA-19 | AES-encrypted zips cannot be read | Bug | Medium | TODO |
+| OA-20 | Arrow keys in an empty folder overflow / panic | Bug | Medium | TODO |
+| OA-21 | ~~GUI lists 7z folders twice~~ | Bug | Medium | **DONE** |
+| OA-22 | GUI "Test" button reports success without testing | Bug | High | TODO |
+| OA-23 | 7z listing always reports entries as unencrypted | Bug | Low | TODO |
 
 ---
 
@@ -103,26 +109,43 @@ matches overwrite one another or the intended file.~~
 
 ---
 
-## OA-3 — GUI cannot open password-protected archives
+## ~~OA-3 — GUI cannot open password-protected archives~~ — DONE
 
-**Type:** Bug · **Priority:** High · **Component:** `gui` · **Status:** TODO
+**Type:** Bug · **Priority:** High · **Component:** `gui` · **Status:** DONE
 
 ### Description
 
-Every GUI call to `get_reader` / `ExtractOptions` passes `password: None`
+~~Every GUI call to `get_reader` / `ExtractOptions` passes `password: None`
 (`src/gui.rs` `extract_and_open_temp`, `handle_context_action`, `extract_current`).
-Encrypted 7z/zip archives cannot be extracted or previewed from the GUI.
+Encrypted 7z/zip archives cannot be extracted or previewed from the GUI.~~
 
-### Suggested fix
+### Resolution
 
-Detect encryption (`ArchiveEntry::encrypted`, or a decrypt error), show a password dialog,
-cache the password per opened archive, and pass it through.
+- `formats::password_problem(&anyhow::Error) -> Option<PasswordProblem>` classifies errors as
+  `Required` / `Incorrect` by walking the error chain, including the payload of `io::Error`s
+  (7z `PasswordRequired` / `MaybeBadPassword`; zip `InvalidPassword` /
+  `UnsupportedArchive(PASSWORD_REQUIRED)`).
+- GUI archive actions (list, open/preview, open with, extract item, extract all) are now an
+  `ArchiveOp` run through `run_archive_op`. On a password problem it opens a
+  "Password required" dialog and retries the same operation with the entered password; a wrong
+  password re-opens it with "Wrong password, try again." Cancel / Escape closes it.
+- Passwords are remembered in memory per archive for the session (dropped when they fail), so
+  browsing folders of an unlocked archive does not re-prompt.
+- Global keyboard shortcuts (Backspace = up, Enter = open, arrows) are disabled while the
+  dialog is open.
+- Tests: 3 classifier tests in `formats` (real encrypted 7z; zip errors through wrappers;
+  non-password errors), 5 GUI state tests (prompt → wrong → right → browse → extract all;
+  extract item retry; cancel; unencrypted archive; corrupt archive reports instead of
+  prompting). Checked in the running GUI: dialog layout, status bar, unlocking with the right
+  password.
+- Note: our 7z writer encrypts headers, so even listing needs the password. Encrypted zips
+  only work for ZipCrypto until OA-19.
 
 ---
 
 ## OA-4 — GUI swallows extraction errors
 
-**Type:** Bug · **Priority:** High · **Component:** `gui` · **Status:** TODO
+**Type:** Bug · **Priority:** High · **Component:** `gui` · **Status:** IN PROGRESS
 
 ### Description
 
@@ -133,6 +156,11 @@ Same for `fs::copy` / `create_dir_all` results discarded with `let _ =`.
 
 Match on the result and show the error via `show_notification` (or a modal for serious
 failures).
+
+**Progress:** with OA-3, all archive operations (list, preview, extract item, extract all)
+report failures in a notification and the status bar. Remaining: disk-mode "Extract" copy
+(`fs::copy` / `create_dir_all` with `let _ =`), the temp dir for previews, and opening files
+externally (`spawn()` results ignored).
 
 ---
 
@@ -337,3 +365,108 @@ Add `ArchiveFormat::TarXz` with xz reader/writer from `lzma-rust2`, extension an
 ### Suggested fix
 
 Delete, move under `benches/`, or add to `.gitignore`.
+
+---
+
+## OA-18 — `a x.zip -p…` silently creates an unencrypted zip
+
+**Type:** Security bug · **Priority:** Critical · **Component:** `formats::zip` · **Status:** TODO
+
+### Description
+
+The zip writer never reads `CompressionOptions::password`. `openarchive a pw.zip src -psecret`
+reports success and writes a plain zip whose contents anyone can read (verified with Python's
+`zipfile`: no entry has the encryption flag, contents readable without a password). Users
+believe their data is protected.
+
+### Suggested fix
+
+Enable the `zip` crate's `aes-crypto` feature and use
+`SimpleFileOptions::with_aes_encryption(AesMode::Aes256, password)` for every file entry,
+including the parallel batch and temp-spill paths. Until then, refuse `-p` for zip with a
+clear error rather than ignoring it. Add a test that a `-p` zip cannot be read without the
+password.
+
+---
+
+## OA-19 — AES-encrypted zips cannot be read
+
+**Type:** Bug · **Priority:** Medium · **Component:** `formats::zip` · **Status:** TODO
+
+### Description
+
+`zip` is built without `aes-crypto`, so only legacy ZipCrypto archives can be decrypted.
+AES zips (the default for 7-Zip / WinZip "encrypt") fail with
+`UnsupportedArchive("AES encrypted files cannot be decrypted without the aes-crypto feature.")`.
+
+### Suggested fix
+
+Enable `aes-crypto` (shared with OA-18) and add a roundtrip test; `password_problem` already
+classifies the resulting password errors for the GUI.
+
+---
+
+## OA-20 — Arrow keys in an empty folder overflow / panic
+
+**Type:** Bug · **Priority:** Medium · **Component:** `gui` · **Status:** TODO
+
+### Description
+
+In `update()`, the guard `if !total == 0 { return; }` applies bitwise NOT to `total`, so it
+never returns. With no items, ArrowDown computes `total - 1`, which panics in debug builds
+(overflow) and selects a nonsense index in release.
+
+### Suggested fix
+
+`if total == 0 { return; }`, plus a test of the selection helpers on an empty list.
+
+---
+
+## ~~OA-21 — GUI lists 7z folders twice~~ — DONE
+
+**Type:** Bug · **Priority:** Medium · **Component:** `gui` · **Status:** DONE
+
+### Description
+
+~~7z stores folder entries without a trailing slash (`src`). `filter_archive_entries` added
+such an entry as a row without recording it in `seen_dirs`, and the folder was added again
+for the files inside it, so every 7z folder appeared twice.~~
+
+### Resolution
+
+Folder entries are now recorded in `seen_dirs` and skipped when already listed.
+Test: `gui::listing_tests::folder_entries_are_listed_once` (7z-style before/after its files,
+zip-style with trailing slash). Found while testing OA-3.
+
+---
+
+## OA-22 — GUI "Test" button reports success without testing
+
+**Type:** Bug · **Priority:** High · **Component:** `gui` · **Status:** TODO
+
+### Description
+
+The toolbar "✔ Test" button only calls
+`show_notification("Archive testing: Everything is Ok")`; it never runs `ArchiveReader::test`.
+A corrupt archive is reported as OK.
+
+### Suggested fix
+
+Add `ArchiveOp::Test` and run `reader.test(password)` through `run_archive_op` (gets the
+password prompt for free); report the real result. Ideally on a worker thread (OA-5).
+
+---
+
+## OA-23 — 7z listing always reports entries as unencrypted
+
+**Type:** Bug · **Priority:** Low · **Component:** `formats::sevenz` · **Status:** TODO
+
+### Description
+
+`SevenZHandler::list` hardcodes `encrypted: false`, so `ArchiveEntry::encrypted` is wrong for
+7z archives with encrypted content but plain headers.
+
+### Suggested fix
+
+Set it from the entry's block coders (AES method id present), as `zip` does with
+`file.encrypted()`.
