@@ -1,11 +1,73 @@
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use memmap2::{Mmap, MmapOptions};
 
 use crate::core::progress::Progress;
+
+/// Failure to write an extracted file (create it, or write its bytes).
+///
+/// It travels inside an `io::Error` so that it can be told apart from read
+/// errors: sevenz-rust2 reports every I/O error raised while reading an
+/// encrypted archive, ours included, as a possibly wrong password.
+#[derive(Debug)]
+pub struct WriteError {
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl WriteError {
+    /// Wraps `source`, an error writing `path`, keeping its kind.
+    pub(crate) fn wrap(path: &Path, source: io::Error) -> io::Error {
+        io::Error::new(source.kind(), WriteError { path: path.to_path_buf(), source })
+    }
+
+    /// The file that could not be written.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A copy (the underlying OS error is kept as kind and message).
+    pub(crate) fn duplicate(&self) -> io::Error {
+        let source = io::Error::new(self.source.kind(), self.source.to_string());
+        Self::wrap(&self.path, source)
+    }
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot write {}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for WriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// A writer whose errors are tagged as [`WriteError`]s for `path`.
+struct TaggedWriter<'a, W> {
+    inner: W,
+    path: &'a Path,
+}
+
+impl<W: Write> Write for TaggedWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf).map_err(|err| WriteError::wrap(self.path, err))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush().map_err(|err| WriteError::wrap(self.path, err))
+    }
+}
+
+/// Creates (or truncates) an extracted file; failures are [`WriteError`]s.
+fn create_output(path: &Path) -> io::Result<File> {
+    File::create(path).map_err(|err| WriteError::wrap(path, err))
+}
 
 /// Buffer size for large sequential reads and writes. Large enough to keep
 /// syscall overhead low without making per-worker memory noticeable.
@@ -215,7 +277,8 @@ pub(crate) fn copy_file_to<W: Write>(path: &Path, size: u64, writer: &mut W) -> 
 /// large ones reuse the thread-local copy buffer.
 ///
 /// If the copy fails or is cancelled, the partly written file is removed so
-/// a truncated file is never left looking complete.
+/// a truncated file is never left looking complete. Errors creating or
+/// writing the file are [`WriteError`]s; read errors are returned as is.
 pub(crate) fn copy_to_file<R: Read + ?Sized>(
     reader: &mut R,
     path: &Path,
@@ -225,7 +288,7 @@ pub(crate) fn copy_to_file<R: Read + ?Sized>(
     if let Some(progress) = progress {
         progress.check()?;
     }
-    let mut file = File::create(path)?;
+    let mut file = TaggedWriter { inner: create_output(path)?, path };
     let result = copy_stream(reader, &mut file, size, progress);
     if result.is_err() {
         drop(file);
@@ -236,15 +299,16 @@ pub(crate) fn copy_to_file<R: Read + ?Sized>(
 
 /// Write an entry that is already fully decoded in memory. Avoids a
 /// `BufWriter` allocation and an extra copy for small-file extraction.
+/// Failures are [`WriteError`]s.
 pub(crate) fn write_buffer(path: &Path, data: &[u8], progress: Option<&Progress>) -> io::Result<()> {
     if let Some(progress) = progress {
         progress.check()?;
     }
-    let mut file = File::create(path)?;
+    let mut file = create_output(path)?;
     if let Err(err) = file.write_all(data) {
         drop(file);
         let _ = std::fs::remove_file(path);
-        return Err(err);
+        return Err(WriteError::wrap(path, err));
     }
     if let Some(progress) = progress {
         progress.add(data.len() as u64);

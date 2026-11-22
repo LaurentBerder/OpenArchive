@@ -13,6 +13,7 @@ pub mod progress;
 pub use conflict::{Aborted, Conflicts, Decision, OverwriteMode, Prompter};
 pub use filter::EntryFilter;
 pub use inputs::{Expanded, Input};
+pub use io::WriteError;
 pub use progress::{Cancelled, Progress};
 
 /// Logical CPUs available to this process (at least 1).

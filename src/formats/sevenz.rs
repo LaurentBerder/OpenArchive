@@ -153,8 +153,8 @@ impl SevenZHandler {
     }
 }
 
-impl ArchiveReader for SevenZHandler {
-    fn list(&mut self) -> Result<Vec<ArchiveEntry>> {
+impl SevenZHandler {
+    fn list_entries(&mut self) -> Result<Vec<ArchiveEntry>> {
         let pass = self
             .password
             .as_deref()
@@ -179,7 +179,7 @@ impl ArchiveReader for SevenZHandler {
         Ok(entries)
     }
 
-    fn extract(&mut self, options: &ExtractOptions, filter: Option<&EntryFilter>) -> Result<()> {
+    fn extract_entries(&mut self, options: &ExtractOptions, filter: Option<&EntryFilter>) -> Result<()> {
         let pass = options
             .password
             .as_deref()
@@ -402,7 +402,7 @@ impl ArchiveReader for SevenZHandler {
         Ok(())
     }
 
-    fn test(&mut self, password: Option<&str>, filter: Option<&EntryFilter>, progress: Option<&Progress>) -> Result<()> {
+    fn test_entries(&mut self, password: Option<&str>, filter: Option<&EntryFilter>, progress: Option<&Progress>) -> Result<()> {
         let pass = password
             .or(self.password.as_deref())
             .map(Password::from)
@@ -428,6 +428,22 @@ impl ArchiveReader for SevenZHandler {
         })?;
 
         Ok(())
+    }
+}
+
+impl ArchiveReader for SevenZHandler {
+    fn list(&mut self) -> Result<Vec<ArchiveEntry>> {
+        self.list_entries()
+    }
+
+    fn extract(&mut self, options: &ExtractOptions, filter: Option<&EntryFilter>) -> Result<()> {
+        // sevenz-rust2 wraps errors from our own file writes (as
+        // MaybeBadPassword when encrypted); report them plainly (OA-27).
+        self.extract_entries(options, filter).map_err(super::surface_write_error)
+    }
+
+    fn test(&mut self, password: Option<&str>, filter: Option<&EntryFilter>, progress: Option<&Progress>) -> Result<()> {
+        self.test_entries(password, filter, progress)
     }
 }
 

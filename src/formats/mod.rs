@@ -61,10 +61,11 @@ pub enum PasswordProblem {
 /// `io::Error`, so the whole chain is searched, including the payload of each
 /// `io::Error` (whose `source()` skips it).
 ///
-/// A cancellation is never a password problem, even though sevenz-rust2
-/// reports any I/O error during an encrypted read as `MaybeBadPassword`.
+/// A cancellation, an abort or a failure to write a file is never a password
+/// problem, even though sevenz-rust2 reports any I/O error during an
+/// encrypted read as `MaybeBadPassword`.
 pub fn password_problem(err: &anyhow::Error) -> Option<PasswordProblem> {
-    if is_cancelled(err) || is_aborted(err) {
+    if is_cancelled(err) || is_aborted(err) || write_error(err).is_some() {
         return None;
     }
     err.chain().find_map(classify_password_error)
@@ -86,24 +87,46 @@ pub fn is_aborted(err: &anyhow::Error) -> bool {
     err.chain().any(contains::<crate::core::Aborted>)
 }
 
+/// The extracted file that could not be written, if that is why `err`
+/// happened.
+pub fn write_error(err: &anyhow::Error) -> Option<&crate::core::WriteError> {
+    err.chain().find_map(find::<crate::core::WriteError>)
+}
+
+/// Replaces an error that carries a [`crate::core::WriteError`] by that
+/// error alone, so the message names the file instead of showing
+/// sevenz-rust2's `MaybeBadPassword(…)` wrapper.
+pub(crate) fn surface_write_error(err: anyhow::Error) -> anyhow::Error {
+    match write_error(&err) {
+        Some(write) => anyhow::Error::new(write.duplicate()),
+        None => err,
+    }
+}
+
 /// Whether `err` is a `T` or carries one inside an `io::Error`, including
 /// through sevenz-rust2's wrappers, which expose no `source()`.
 fn contains<T: std::error::Error + 'static>(err: &(dyn std::error::Error + 'static)) -> bool {
-    if err.is::<T>() {
-        return true;
+    find::<T>(err).is_some()
+}
+
+/// `err` as a `T`, or the `T` it carries inside an `io::Error` (also
+/// through sevenz-rust2's wrappers).
+fn find<'a, T: std::error::Error + 'static>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a T> {
+    if let Some(found) = err.downcast_ref::<T>() {
+        return Some(found);
     }
     if let Some(err) = err.downcast_ref::<std::io::Error>() {
-        return err.get_ref().is_some_and(|inner| contains::<T>(inner));
+        return err.get_ref().and_then(|inner| find::<T>(inner));
     }
     if let Some(err) = err.downcast_ref::<sevenz_rust2::Error>() {
         return match err {
             sevenz_rust2::Error::Io(inner, _)
             | sevenz_rust2::Error::FileOpen(inner, _)
-            | sevenz_rust2::Error::MaybeBadPassword(inner) => contains::<T>(inner),
-            _ => false,
+            | sevenz_rust2::Error::MaybeBadPassword(inner) => find::<T>(inner),
+            _ => None,
         };
     }
-    false
+    None
 }
 
 /// Files that extracting `archive` with `options` would overwrite: existing
@@ -389,6 +412,38 @@ mod tests {
             let err = extract_with(&archive, &dir.join("out"), Some("right"), threads, &progress).unwrap_err();
             assert!(is_cancelled(&err), "t{threads}: {err:#}");
             assert_eq!(password_problem(&err), None, "t{threads}: {err:#}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_errors_in_an_encrypted_7z_are_not_password_problems() {
+        // sevenz-rust2 also rewraps errors from our own writes as
+        // MaybeBadPassword (OA-27): a file that cannot be written must be
+        // reported as such, not as a wrong password.
+        let dir = temp_dir("write-err");
+        let big: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("src/big.bin"), big).unwrap();
+        for solid in [true, false] {
+            let archive = dir.join(format!("w{solid}.7z"));
+            let options = CompressionOptions { password: Some("right".into()), solid, ..Default::default() };
+            create_archive(&archive, &[dir.join("src")], &options).unwrap();
+            for threads in [1, 4] {
+                let out = dir.join("out");
+                let _ = std::fs::remove_dir_all(&out);
+                // A folder where each file should go: creating the file fails.
+                std::fs::create_dir_all(out.join("src/a.txt")).unwrap();
+                std::fs::create_dir_all(out.join("src/big.bin")).unwrap();
+                let progress = Arc::new(Progress::new());
+                let err = extract_with(&archive, &out, Some("right"), threads, &progress).unwrap_err();
+                let context = format!("solid={solid} t{threads}: {err:#}");
+                assert_eq!(password_problem(&err), None, "{context}");
+                assert!(!is_cancelled(&err), "{context}");
+                let message = err.to_string();
+                assert!(message.starts_with("cannot write "), "{context}");
+                assert!(message.contains("a.txt") || message.contains("big.bin"), "{context}");
+                assert!(!format!("{err:#}").contains("MaybeBadPassword"), "{context}");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
