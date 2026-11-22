@@ -131,7 +131,7 @@ impl Read for LazyFileReader {
         let n = self.reader.as_mut().unwrap().read(buf)?;
         if n == 0 {
             self.end = true;
-            self.reader = None; // Release OS file handle immediately
+            self.reader = None; // Release the OS file handle immediately
         }
         Ok(n)
     }

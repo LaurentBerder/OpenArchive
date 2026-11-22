@@ -808,6 +808,46 @@ fn test_tar_large_entries_use_sequential_path() {
 }
 
 #[test]
+fn test_zip_mmap_large_file_roundtrip() {
+    let test_dir = "test_data_zip_mmap";
+    fs::create_dir_all(test_dir).unwrap();
+    let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    fs::write(format!("{}/large.bin", test_dir), &payload).unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+
+    // Lower the threshold so this small fixture goes through the memory-mapped
+    // windowed-read path.
+    let created = Command::new(exe)
+        .args(["a", "archive_mmap.zip", test_dir, "-mx=0", "-mmt=1"])
+        .env("OPENARCHIVE_MMAP_THRESHOLD_MB", "1")
+        .status()
+        .unwrap();
+    assert!(created.success());
+
+    let tested = Command::new(exe)
+        .args(["t", "archive_mmap.zip"])
+        .status()
+        .unwrap();
+    assert!(tested.success());
+
+    let extracted = Command::new(exe)
+        .args(["x", "archive_mmap.zip", "-o", "out_zip_mmap"])
+        .status()
+        .unwrap();
+    assert!(extracted.success());
+
+    assert_eq!(
+        fs::read("out_zip_mmap/test_data_zip_mmap/large.bin").unwrap(),
+        payload
+    );
+
+    let _ = fs::remove_dir_all(test_dir);
+    let _ = fs::remove_dir_all("out_zip_mmap");
+    let _ = fs::remove_file("archive_mmap.zip");
+}
+
+#[test]
 fn test_zip_parallel_roundtrip() {
     let test_dir = "test_data_zip_parallel";
     fs::create_dir_all(format!("{}/sub1", test_dir)).unwrap();

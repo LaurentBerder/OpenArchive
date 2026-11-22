@@ -3,6 +3,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+use memmap2::{Mmap, MmapOptions};
+
 /// Buffer size for large sequential reads and writes. Large enough to keep
 /// syscall overhead low without making per-worker memory noticeable.
 pub(crate) const IO_BUFFER_SIZE: usize = 256 * 1024;
@@ -17,6 +19,62 @@ pub(crate) const SMALL_FILE_THRESHOLD: u64 = 64 * 1024;
 
 /// A small buffer still amortizes the 4 KB reads used by the 7z encoder.
 pub(crate) const SMALL_READ_BUFFER: usize = 8 * 1024;
+
+/// Files at or above this size are mapped instead of read through a buffer.
+/// Mapping avoids repeated read syscalls and the associated copies for very
+/// large single files. `OPENARCHIVE_MMAP_THRESHOLD_MB=0` disables mapping.
+const DEFAULT_MMAP_THRESHOLD: u64 = 64 * 1024 * 1024;
+
+pub(crate) fn mmap_threshold() -> u64 {
+    match std::env::var("OPENARCHIVE_MMAP_THRESHOLD_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        Some(0) => u64::MAX,
+        Some(mb) => mb.saturating_mul(1024 * 1024),
+        None => DEFAULT_MMAP_THRESHOLD,
+    }
+}
+
+/// A read-only mapping window. Mapping the whole file would keep every touched
+/// page in the process working set; windows bound that while still avoiding
+/// per-buffer read syscalls.
+const MMAP_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read-only memory mapping used for very large sequential inputs.
+pub(crate) struct MappedFile {
+    map: Mmap,
+    position: usize,
+}
+
+impl MappedFile {
+    pub(crate) fn map_range(file: &File, offset: u64, len: u64) -> Option<Self> {
+        let len = usize::try_from(len).ok()?;
+        // SAFETY: the mapping is read-only and is dropped with this value. As
+        // with any mmap, callers must not truncate or rewrite the file while it
+        // is mapped.
+        let map = unsafe { MmapOptions::new().offset(offset).len(len).map(file) }.ok()?;
+        Some(Self { map, position: 0 })
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.map
+    }
+}
+
+impl Read for MappedFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.map.len().saturating_sub(self.position);
+        if remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+
+        let len = remaining.min(buf.len());
+        buf[..len].copy_from_slice(&self.map[self.position..self.position + len]);
+        self.position += len;
+        Ok(len)
+    }
+}
 
 #[cfg(windows)]
 const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
@@ -78,7 +136,36 @@ pub(crate) fn read_buffer_capacity(size: u64) -> usize {
 
 /// Copy a file into a writer, choosing the buffer from its size.
 pub(crate) fn copy_file_to<W: Write>(path: &Path, size: u64, writer: &mut W) -> io::Result<()> {
-    let mut file = open_sequential(path)?;
+    let file = open_sequential(path)?;
+
+    if size >= mmap_threshold() {
+        let mut offset = 0u64;
+        while offset < size {
+            let len = (size - offset).min(MMAP_WINDOW_BYTES);
+            match MappedFile::map_range(&file, offset, len) {
+                Some(mapping) => {
+                    writer.write_all(mapping.as_slice())?;
+                    offset += len;
+                }
+                None => break,
+            }
+        }
+
+        if offset == size {
+            return Ok(());
+        }
+
+        if offset == 0 {
+            let mut file = file;
+            return copy_stream(&mut file, writer, size);
+        }
+
+        return Err(io::Error::other(
+            "large-file mapping failed after a partial write",
+        ));
+    }
+
+    let mut file = file;
     copy_stream(&mut file, writer, size)
 }
 
@@ -334,5 +421,28 @@ mod tests {
             SMALL_READ_BUFFER
         );
         assert_eq!(read_buffer_capacity(SMALL_FILE_THRESHOLD), IO_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn mapped_file_reads_the_same_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "openarchive-mmap-test-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &payload).unwrap();
+
+        let file = File::open(&path).unwrap();
+        let mut mapped =
+            MappedFile::map_range(&file, 0, payload.len() as u64).expect("mapping should succeed");
+        let mut read = Vec::new();
+        mapped.read_to_end(&mut read).unwrap();
+
+        assert_eq!(read, payload);
+        let _ = std::fs::remove_file(&path);
     }
 }
