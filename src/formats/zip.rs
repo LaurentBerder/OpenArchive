@@ -194,6 +194,10 @@ impl ArchiveReader for ZipHandler {
                     dirs_to_create.insert(target_path);
                 }
             } else {
+                // Existing file: overwrite, skip, rename or ask (OA-9).
+                let Some(target_path) = options.conflicts.resolve(&target_path)? else {
+                    continue;
+                };
                 if let Some(parent) = target_path.parent() {
                     // Most files share a parent; only allocate a new key once.
                     if !dirs_to_create.contains(parent) {

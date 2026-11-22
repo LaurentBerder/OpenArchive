@@ -6,7 +6,7 @@ use flate2::Compression as GzCompression;
 use flate2::read::MultiGzDecoder;
 use lzma_rust2::{DICT_SIZE_MAX, DICT_SIZE_MIN, XzOptions, XzReader, XzWriter, XzWriterMt};
 use flate2::write::GzEncoder;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, empty};
 use std::num::NonZeroU64;
@@ -108,13 +108,19 @@ impl TarHandler {
             if entry_type.is_dir() {
                 dirs.insert(target_path);
             } else if entry_type.is_file() {
+                if !targets.insert(target_path.clone()) {
+                    return Ok(false);
+                }
+                // Existing file: overwrite, skip, rename or ask (OA-9). If this
+                // path falls back to sequential extraction, the answer is
+                // remembered and not asked again.
+                let Some(target_path) = options.conflicts.resolve(&target_path)? else {
+                    continue;
+                };
                 if let Some(parent) = target_path.parent() {
                     if !dirs.contains(parent) {
                         dirs.insert(parent.to_path_buf());
                     }
-                }
-                if !targets.insert(target_path.clone()) {
-                    return Ok(false);
                 }
                 files.push(TarIndexItem {
                     offset: entry.raw_file_position(),
@@ -273,8 +279,9 @@ impl ArchiveReader for TarHandler {
 
         let mut known_dirs: HashSet<PathBuf> = HashSet::new();
         known_dirs.insert(options.output_dir.clone());
-        // Files written by this run: the only valid hard-link sources.
-        let mut extracted: HashSet<PathBuf> = HashSet::new();
+        // Files written by this run (target -> where it was written, which
+        // differs when renamed): the only valid hard-link sources.
+        let mut extracted: HashMap<PathBuf, PathBuf> = HashMap::new();
 
         for entry in archive.entries()? {
             let mut entry = entry?;
@@ -307,10 +314,14 @@ impl ArchiveReader for TarHandler {
 
             match entry_type {
                 EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
-                    create_parent(&target_path, &mut known_dirs)?;
+                    // Existing file: overwrite, skip, rename or ask (OA-9).
+                    let Some(write_to) = options.conflicts.resolve(&target_path)? else {
+                        continue;
+                    };
+                    create_parent(&write_to, &mut known_dirs)?;
                     let size = entry.size();
-                    file_io::copy_to_file(&mut entry, &target_path, size, options.progress.as_deref())?;
-                    extracted.insert(target_path);
+                    file_io::copy_to_file(&mut entry, &write_to, size, options.progress.as_deref())?;
+                    extracted.insert(target_path, write_to);
                 }
                 EntryType::Link => {
                     // A hard link is written as a copy of its target, which
@@ -320,14 +331,18 @@ impl ArchiveReader for TarHandler {
                     let source = link
                         .as_deref()
                         .and_then(|link| paths::entry_target(&options.output_dir, link, options.flat).ok().flatten())
-                        .filter(|source| source != &target_path && extracted.contains(source));
+                        .filter(|source| source != &target_path)
+                        .and_then(|source| extracted.get(&source).cloned());
                     match source {
                         Some(source) => {
-                            create_parent(&target_path, &mut known_dirs)?;
+                            let Some(write_to) = options.conflicts.resolve(&target_path)? else {
+                                continue;
+                            };
+                            create_parent(&write_to, &mut known_dirs)?;
                             let size = fs::metadata(&source)?.len();
                             let mut reader = File::open(&source)?;
-                            file_io::copy_to_file(&mut reader, &target_path, size, options.progress.as_deref())?;
-                            extracted.insert(target_path);
+                            file_io::copy_to_file(&mut reader, &write_to, size, options.progress.as_deref())?;
+                            extracted.insert(target_path, write_to);
                         }
                         None => warn(
                             options,

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::core::OverwriteMode;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Add,
@@ -25,6 +27,8 @@ pub struct CliArgs {
     pub threads: Option<usize>,
     pub recurse: bool,
     pub assume_yes: bool,
+    /// `-aoa` / `-aos` / `-aou`; `None` means ask (or overwrite with `-y`).
+    pub overwrite_mode: Option<OverwriteMode>,
 }
 
 pub fn parse_dict_size(val: &str) -> Option<u32> {
@@ -95,6 +99,7 @@ impl CliArgs {
                 threads: None,
                 recurse: false,
                 assume_yes: false,
+                overwrite_mode: None,
             });
         }
 
@@ -108,6 +113,7 @@ impl CliArgs {
         let mut threads = None;
         let mut recurse = false;
         let mut assume_yes = false;
+        let mut overwrite_mode = None;
 
         let mut i = 1;
         while i < raw.len() {
@@ -201,6 +207,17 @@ impl CliArgs {
                 recurse = arg == "-r";
             } else if arg == "-y" {
                 assume_yes = true;
+            } else if let Some(mode) = arg.strip_prefix("-ao") {
+                overwrite_mode = Some(match mode {
+                    "a" => OverwriteMode::Overwrite,
+                    "s" => OverwriteMode::Skip,
+                    "u" => OverwriteMode::Rename,
+                    _ => {
+                        return Err(format!(
+                            "unsupported switch {arg}: use -aoa (overwrite), -aos (skip) or -aou (rename new files)"
+                        ));
+                    }
+                });
             } else if arg.starts_with('-') {
                 // Ignore other switches gracefully or handle options
             } else if command_str.is_empty() {
@@ -248,6 +265,7 @@ impl CliArgs {
                 threads,
                 recurse,
                 assume_yes,
+                overwrite_mode,
             });
         }
 
@@ -270,6 +288,7 @@ impl CliArgs {
             threads,
             recurse,
             assume_yes,
+            overwrite_mode,
         })
     }
 
@@ -286,6 +305,7 @@ impl CliArgs {
             threads: None,
             recurse: false,
             assume_yes: false,
+            overwrite_mode: None,
         }
     }
 }

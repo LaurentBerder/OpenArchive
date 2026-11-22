@@ -2,11 +2,13 @@ use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub mod conflict;
 mod detect;
 pub(crate) mod io;
 pub(crate) mod paths;
 pub mod progress;
 
+pub use conflict::{Aborted, Conflicts, Decision, OverwriteMode, Prompter};
 pub use progress::{Cancelled, Progress};
 
 /// Logical CPUs available to this process (at least 1).
@@ -128,7 +130,9 @@ pub struct ExtractOptions {
     pub output_dir: PathBuf,
     pub flat: bool,
     pub password: Option<String>,
-    pub overwrite: bool,
+    /// What to do with files that already exist (default: overwrite). Shared,
+    /// so each file is decided once across planning passes and threads.
+    pub conflicts: Arc<Conflicts>,
     pub threads: Option<usize>,
     /// Reports bytes written and lets the caller cancel. On cancellation the
     /// file being written is removed and extraction fails with [`Cancelled`].
@@ -148,7 +152,7 @@ impl Default for ExtractOptions {
             output_dir: PathBuf::from("."),
             flat: false,
             password: None,
-            overwrite: true,
+            conflicts: Arc::new(Conflicts::default()),
             threads: None,
             progress: None,
         }

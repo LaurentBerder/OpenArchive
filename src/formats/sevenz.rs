@@ -212,6 +212,11 @@ impl ArchiveReader for SevenZHandler {
                     dir_set.insert(target_path);
                 }
             } else {
+                // Existing file: overwrite, skip, rename or ask (OA-9). The
+                // answer is remembered for the extraction passes below.
+                let Some(target_path) = options.conflicts.resolve(&target_path)? else {
+                    continue;
+                };
                 total_bytes = total_bytes.saturating_add(f.size());
                 if let Some(parent) = target_path.parent() {
                     if !dir_set.contains(parent) {
@@ -259,6 +264,9 @@ impl ArchiveReader for SevenZHandler {
                     let Some(target_path) =
                         paths::entry_target(&options.output_dir, name, options.flat)?
                     else {
+                        return Ok(true);
+                    };
+                    let Some(target_path) = options.conflicts.resolve(&target_path)? else {
                         return Ok(true);
                     };
 
@@ -328,6 +336,9 @@ impl ArchiveReader for SevenZHandler {
                         let Some(target_path) =
                             paths::entry_target(&options.output_dir, name, options.flat)?
                         else {
+                            return Ok(true);
+                        };
+                        let Some(target_path) = options.conflicts.resolve(&target_path)? else {
                             return Ok(true);
                         };
 
@@ -517,6 +528,9 @@ fn extract_blocks_parallel(
                             let Some(target_path) =
                                 paths::entry_target(&options.output_dir, name, options.flat)?
                             else {
+                                return Ok(true);
+                            };
+                            let Some(target_path) = options.conflicts.resolve(&target_path)? else {
                                 return Ok(true);
                             };
 
