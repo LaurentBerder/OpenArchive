@@ -335,4 +335,108 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── TAR links and special entries (OA-7) ─────────────────────────────────
+
+    /// A TAR with raw names and link targets: `::tar::Builder` refuses `..` in
+    /// names it sets itself, so header fields are written directly.
+    fn tar_entries(entries: &[(&str, ::tar::EntryType, &str, &[u8])]) -> Vec<u8> {
+        let mut builder = ::tar::Builder::new(Vec::new());
+        for (name, entry_type, link, data) in entries {
+            let mut header = ::tar::Header::new_gnu();
+            header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            header.as_old_mut().linkname[..link.len()].copy_from_slice(link.as_bytes());
+            header.set_entry_type(*entry_type);
+            header.set_mode(0o644);
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder.append(&header, *data).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    fn write_tar_variant(dir: &Path, stem: &str, bytes: &[u8], gz: bool) -> PathBuf {
+        use std::io::Write;
+        if gz {
+            let path = dir.join(format!("{stem}.tar.gz"));
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(bytes).unwrap();
+            std::fs::write(&path, encoder.finish().unwrap()).unwrap();
+            path
+        } else {
+            let path = dir.join(format!("{stem}.tar"));
+            std::fs::write(&path, bytes).unwrap();
+            path
+        }
+    }
+
+    #[test]
+    fn tar_hard_links_are_copied_and_other_links_skipped() {
+        use ::tar::EntryType::*;
+        let bytes = tar_entries(&[
+            ("pax_global_header", XGlobalHeader, "", b"52 comment=abc
+"),
+            ("a.txt", Regular, "", b"hello"),
+            ("h.txt", Link, "a.txt", b""),
+            ("s.txt", Symlink, "a.txt", b""),
+            ("evil", Symlink, "../../x", b""),
+            ("h_unsafe", Link, "../outside", b""),
+            ("h_foreign", Link, "never.txt", b""),
+            ("fifo", Fifo, "", b""),
+        ]);
+
+        for (gz, threads) in [(false, 1), (false, 4), (true, 1)] {
+            let dir = temp_dir(&format!("tarlinks-{gz}-{threads}"));
+            let archive = write_tar_variant(&dir, "links", &bytes, gz);
+            let out = dir.join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            // Exists in the output folder but is not from this archive.
+            std::fs::write(out.join("never.txt"), b"keep").unwrap();
+
+            let progress = Arc::new(Progress::new());
+            extract_with(&archive, &out, None, threads, &progress).unwrap();
+            let label = format!("gz={gz} t{threads}");
+
+            assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"hello", "{label}");
+            // The hard link is a real file with the same content, not a link.
+            let h = std::fs::symlink_metadata(out.join("h.txt")).unwrap();
+            assert!(h.is_file() && !h.file_type().is_symlink(), "{label}");
+            assert_eq!(std::fs::read(out.join("h.txt")).unwrap(), b"hello", "{label}");
+
+            for skipped in ["s.txt", "evil", "h_unsafe", "h_foreign", "fifo", "pax_global_header"] {
+                assert!(std::fs::symlink_metadata(out.join(skipped)).is_err(), "{label}: {skipped} was created");
+            }
+            assert!(!dir.join("x").exists() && !dir.join("outside").exists(), "{label}");
+            assert_eq!(std::fs::read(out.join("never.txt")).unwrap(), b"keep", "{label}");
+
+            let warnings = progress.warnings();
+            assert_eq!(warnings.len(), 5, "{label}: {warnings:?}");
+            assert!(warnings.iter().any(|w| w == "skipped symbolic link s.txt -> a.txt"), "{label}: {warnings:?}");
+            assert!(warnings.iter().any(|w| w.starts_with("skipped hard link h_foreign -> never.txt")), "{label}");
+            assert!(warnings.iter().any(|w| w.starts_with("skipped special file fifo")), "{label}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn git_style_tar_keeps_the_parallel_path() {
+        use ::tar::EntryType::*;
+        let big = vec![b'z'; 200_000];
+        let bytes = tar_entries(&[
+            ("pax_global_header", XGlobalHeader, "", b"52 comment=abc
+"),
+            ("a.txt", Regular, "", b"one"),
+            ("b.txt", Regular, "", &big),
+        ]);
+        let dir = temp_dir("gitstyle");
+        let archive = write_tar_variant(&dir, "git", &bytes, false);
+        let progress = Arc::new(Progress::new());
+        extract_with(&archive, &dir.join("out"), None, 4, &progress).unwrap();
+
+        assert!(!dir.join("out/pax_global_header").exists());
+        assert_eq!(std::fs::read(dir.join("out/a.txt")).unwrap(), b"one");
+        // Only the indexed (parallel) path knows the total up front.
+        assert_eq!(progress.total(), Some(3 + 200_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -2,16 +2,19 @@
 
 use std::fmt;
 use std::io;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Shared between an operation and whoever watches it (the GUI). The
-/// operation reports bytes as it writes or verifies them and checks for
-/// cancellation; the watcher reads the counters and may cancel.
+/// operation reports bytes as it writes or verifies them, notes entries it
+/// skipped, and checks for cancellation; the watcher reads the counters and
+/// warnings and may cancel.
 #[derive(Debug, Default)]
 pub struct Progress {
     done: AtomicU64,
     total: AtomicU64,
     cancelled: AtomicBool,
+    warnings: Mutex<Vec<String>>,
 }
 
 impl Progress {
@@ -52,6 +55,17 @@ impl Progress {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Records something the operation skipped or could not do exactly, such
+    /// as a symbolic link it did not create.
+    pub(crate) fn warn(&self, message: String) {
+        self.warnings.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(message);
+    }
+
+    /// Warnings recorded so far, oldest first.
+    pub fn warnings(&self) -> Vec<String> {
+        self.warnings.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
     /// Returns a [`Cancelled`] error once [`Progress::cancel`] was called.

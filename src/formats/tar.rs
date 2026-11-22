@@ -11,7 +11,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, empty};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tar::Header;
+use tar::{EntryType, Header};
 use walkdir::WalkDir;
 
 use super::stream_compress::{self, Codec, ParallelCompressor};
@@ -82,6 +82,15 @@ impl TarHandler {
 
         for entry in archive.entries_with_seek()? {
             let entry = entry?;
+            let entry_type = entry.header().entry_type();
+            // Metadata records (e.g. git's `pax_global_header`) are not files
+            // and need not force the sequential path.
+            if matches!(
+                entry_type,
+                EntryType::XGlobalHeader | EntryType::XHeader | EntryType::GNULongName | EntryType::GNULongLink
+            ) {
+                continue;
+            }
             let name = entry.path()?.to_string_lossy().to_string();
 
             if !paths::matches_filter(filter, &name) {
@@ -91,7 +100,6 @@ impl TarHandler {
             let Some(target_path) = paths::entry_target(&options.output_dir, &name, false)? else {
                 continue;
             };
-            let entry_type = entry.header().entry_type();
 
             if entry_type.is_dir() {
                 dirs.insert(target_path);
@@ -268,11 +276,22 @@ impl ArchiveReader for TarHandler {
 
         let mut known_dirs: HashSet<PathBuf> = HashSet::new();
         known_dirs.insert(options.output_dir.clone());
+        // Files written by this run: the only valid hard-link sources.
+        let mut extracted: HashSet<PathBuf> = HashSet::new();
 
         for entry in archive.entries()? {
             let mut entry = entry?;
-            let name = entry.path()?.to_string_lossy().to_string();
+            let entry_type = entry.header().entry_type();
 
+            // Metadata records, not files (e.g. git's `pax_global_header`).
+            if matches!(
+                entry_type,
+                EntryType::XGlobalHeader | EntryType::XHeader | EntryType::GNULongName | EntryType::GNULongLink
+            ) {
+                continue;
+            }
+
+            let name = entry.path()?.to_string_lossy().to_string();
             if !paths::matches_filter(filter, &name) {
                 continue;
             }
@@ -282,19 +301,56 @@ impl ArchiveReader for TarHandler {
                 continue;
             };
 
-            if entry.header().entry_type().is_dir() {
+            if entry_type.is_dir() {
                 if !options.flat && known_dirs.insert(target_path.clone()) {
                     fs::create_dir_all(&target_path)?;
                 }
-            } else {
-                if let Some(parent) = target_path.parent() {
-                    if !known_dirs.contains(parent) {
-                        fs::create_dir_all(parent)?;
-                        known_dirs.insert(parent.to_path_buf());
+                continue;
+            }
+
+            match entry_type {
+                EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
+                    create_parent(&target_path, &mut known_dirs)?;
+                    let size = entry.size();
+                    file_io::copy_to_file(&mut entry, &target_path, size, options.progress.as_deref())?;
+                    extracted.insert(target_path);
+                }
+                EntryType::Link => {
+                    // A hard link is written as a copy of its target, which
+                    // must be a file this run already extracted. No link is
+                    // created, so it cannot point anywhere else.
+                    let link = entry.link_name()?.map(|link| link.to_string_lossy().to_string());
+                    let source = link
+                        .as_deref()
+                        .and_then(|link| paths::entry_target(&options.output_dir, link, options.flat).ok().flatten())
+                        .filter(|source| source != &target_path && extracted.contains(source));
+                    match source {
+                        Some(source) => {
+                            create_parent(&target_path, &mut known_dirs)?;
+                            let size = fs::metadata(&source)?.len();
+                            let mut reader = File::open(&source)?;
+                            file_io::copy_to_file(&mut reader, &target_path, size, options.progress.as_deref())?;
+                            extracted.insert(target_path);
+                        }
+                        None => warn(
+                            options,
+                            format!(
+                                "skipped hard link {name} -> {}: target was not extracted from this archive",
+                                link.as_deref().unwrap_or("?")
+                            ),
+                        ),
                     }
                 }
-                let size = entry.size();
-                file_io::copy_to_file(&mut entry, &target_path, size, options.progress.as_deref())?;
+                EntryType::Symlink => {
+                    // Never created: a link can redirect later entries outside
+                    // the output directory.
+                    let link = entry.link_name()?.map(|link| link.to_string_lossy().to_string());
+                    warn(
+                        options,
+                        format!("skipped symbolic link {name} -> {}", link.as_deref().unwrap_or("?")),
+                    );
+                }
+                _ => warn(options, format!("skipped special file {name} ({entry_type:?})")),
             }
         }
 
@@ -312,6 +368,26 @@ impl ArchiveReader for TarHandler {
         }
 
         Ok(())
+    }
+}
+
+/// Creates `path`'s parent directory once per directory.
+fn create_parent(path: &Path, known_dirs: &mut HashSet<PathBuf>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !known_dirs.contains(parent)
+    {
+        fs::create_dir_all(parent)?;
+        known_dirs.insert(parent.to_path_buf());
+    }
+    Ok(())
+}
+
+/// Reports an entry that was skipped: to the caller's progress handle when
+/// there is one (the GUI shows it), otherwise on stderr (the CLI).
+fn warn(options: &ExtractOptions, message: String) {
+    match &options.progress {
+        Some(progress) => progress.warn(message),
+        None => eprintln!("Warning: {message}"),
     }
 }
 

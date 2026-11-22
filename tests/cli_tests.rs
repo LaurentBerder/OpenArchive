@@ -1424,3 +1424,37 @@ fn test_zip_empty_password_means_unencrypted() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn test_tar_skipped_links_are_reported_on_stderr() {
+    let dir = PathBuf::from("test_tar_link_warnings");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut file = tar::Header::new_gnu();
+    file.set_size(5);
+    file.set_mode(0o644);
+    file.set_cksum();
+    builder.append_data(&mut file, "a.txt", &b"hello"[..]).unwrap();
+    let mut link = tar::Header::new_gnu();
+    link.set_entry_type(tar::EntryType::Symlink);
+    link.set_size(0);
+    link.set_mode(0o777);
+    builder.append_link(&mut link, "s.txt", "a.txt").unwrap();
+    let archive = dir.join("links.tar");
+    fs::write(&archive, builder.into_inner().unwrap()).unwrap();
+
+    let out = dir.join("out");
+    let output = Command::new(env!("CARGO_BIN_EXE_openarchive"))
+        .args(["x", archive.to_str().unwrap(), "-o", out.to_str().unwrap(), "-mmt=1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Warning: skipped symbolic link s.txt -> a.txt"), "{stderr}");
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"hello");
+    assert!(fs::symlink_metadata(out.join("s.txt")).is_err());
+
+    let _ = fs::remove_dir_all(&dir);
+}

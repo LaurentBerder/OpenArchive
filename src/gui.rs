@@ -67,8 +67,8 @@ enum OpOutcome {
     Listed(Vec<ArchiveEntry>),
     /// `ArchiveOp::Preview`: the extracted file, to open on the UI thread.
     Previewed(PathBuf),
-    /// Extraction or test finished; nothing to hand back.
-    Done,
+    /// Extraction or test finished, with any entries it skipped.
+    Done(Vec<String>),
 }
 
 /// An archive operation running on a worker thread.
@@ -98,6 +98,16 @@ fn op_label(archive_path: &Path, op: &ArchiveOp) -> String {
         ArchiveOp::ExtractItem { name, .. } => format!("Extracting {name}"),
         ArchiveOp::ExtractAll { .. } => format!("Extracting {archive}"),
         ArchiveOp::Test => format!("Testing {archive}"),
+    }
+}
+
+/// Appends skipped entries to a completion message, e.g.
+/// "Extracted to out (2 entries skipped: skipped symbolic link a -> b; …)".
+fn with_warnings(message: String, warnings: &[String]) -> String {
+    match warnings {
+        [] => message,
+        [only] => format!("{message} (1 entry skipped: {only})"),
+        [first, rest @ ..] => format!("{message} ({} entries skipped: {first}; …)", rest.len() + 1),
     }
 }
 
@@ -821,14 +831,17 @@ impl OpenArchiveGui {
                     Err(err) => self.show_notification(format!("Failed to open {file_name}: {err}")),
                 }
             }
-            (ArchiveOp::ExtractItem { name, dest, .. }, OpOutcome::Done) => {
-                self.show_notification(format!("Extracted {} to {}", name, dest.display()));
+            (ArchiveOp::ExtractItem { name, dest, .. }, OpOutcome::Done(warnings)) => {
+                let message = format!("Extracted {} to {}", name, dest.display());
+                self.show_notification(with_warnings(message, &warnings));
             }
-            (ArchiveOp::ExtractAll { dest }, OpOutcome::Done) => {
-                self.show_notification(format!("Extracted to {}", dest.display()));
+            (ArchiveOp::ExtractAll { dest }, OpOutcome::Done(warnings)) => {
+                let message = format!("Extracted to {}", dest.display());
+                self.show_notification(with_warnings(message, &warnings));
             }
-            (ArchiveOp::Test, OpOutcome::Done) => {
-                self.show_notification(format!("{archive_name}: Everything is Ok"));
+            (ArchiveOp::Test, OpOutcome::Done(warnings)) => {
+                let message = format!("{archive_name}: Everything is Ok");
+                self.show_notification(with_warnings(message, &warnings));
             }
             (op, outcome) => unreachable!("{op:?} cannot produce {outcome:?}"),
         }
@@ -1159,15 +1172,15 @@ fn perform_archive_op(
         ArchiveOp::ExtractItem { full_internal, is_dir, dest, .. } => {
             let filter = [full_internal.clone()];
             reader.extract(&extract_options(dest.clone(), !is_dir), Some(&filter))?;
-            Ok(OpOutcome::Done)
+            Ok(OpOutcome::Done(progress.warnings()))
         }
         ArchiveOp::ExtractAll { dest } => {
             reader.extract(&extract_options(dest.clone(), false), None)?;
-            Ok(OpOutcome::Done)
+            Ok(OpOutcome::Done(progress.warnings()))
         }
         ArchiveOp::Test => {
             reader.test(password.as_deref(), Some(&progress))?;
-            Ok(OpOutcome::Done)
+            Ok(OpOutcome::Done(progress.warnings()))
         }
     }
 }
