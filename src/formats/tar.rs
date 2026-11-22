@@ -43,7 +43,7 @@ impl TarHandler {
         }
     }
 
-    fn open_reader(&self) -> Result<Box<dyn Read>> {
+    fn open_reader(&self) -> Result<Box<dyn Read + Send>> {
         let file = file_io::open_sequential(&self.path)
             .with_context(|| format!("Failed to open archive: {}", self.path.display()))?;
         let buf_file = BufReader::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
@@ -248,7 +248,12 @@ impl ArchiveReader for TarHandler {
             return Ok(());
         }
 
-        let reader = self.open_reader()?;
+        let mut reader = self.open_reader()?;
+        if num_threads > 1 && self.format != ArchiveFormat::Tar {
+            // Decompress on a separate thread so decoding overlaps with
+            // header parsing and file writes.
+            reader = Box::new(file_io::ReadAhead::new(reader)?);
+        }
         let mut archive = tar::Archive::new(reader);
 
         fs::create_dir_all(&options.output_dir)?;

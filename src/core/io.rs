@@ -100,9 +100,143 @@ pub(crate) fn write_buffer(path: &Path, data: &[u8]) -> io::Result<()> {
     file.write_all(data)
 }
 
+/// Size of each block handed from a read-ahead thread to its consumer.
+const READ_AHEAD_BLOCK: usize = 1024 * 1024;
+
+/// Blocks a read-ahead thread may decode before the consumer catches up.
+const READ_AHEAD_DEPTH: usize = 4;
+
+/// Runs a (decompressing) reader on its own thread and hands decoded blocks
+/// to the consumer through a bounded queue. Decompression then overlaps with
+/// whatever the consumer does with the data — parsing TAR headers and
+/// writing files — instead of alternating with it. At most
+/// `READ_AHEAD_DEPTH + 2` blocks are alive at once.
+pub(crate) struct ReadAhead {
+    blocks: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    pos: usize,
+    done: bool,
+}
+
+impl ReadAhead {
+    pub(crate) fn new(mut inner: Box<dyn Read + Send>) -> io::Result<Self> {
+        let (tx, blocks) = std::sync::mpsc::sync_channel(READ_AHEAD_DEPTH);
+        std::thread::Builder::new()
+            .name("openarchive-read-ahead".into())
+            .spawn(move || {
+                loop {
+                    let mut block = vec![0u8; READ_AHEAD_BLOCK];
+                    let mut filled = 0;
+                    let result = loop {
+                        match inner.read(&mut block[filled..]) {
+                            Ok(0) => break Ok(()),
+                            Ok(n) => {
+                                filled += n;
+                                if filled == block.len() {
+                                    break Ok(());
+                                }
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                            Err(e) => break Err(e),
+                        }
+                    };
+                    let eof = result.is_ok() && filled < block.len();
+                    if filled > 0 {
+                        block.truncate(filled);
+                        if tx.send(Ok(block)).is_err() {
+                            return;
+                        }
+                    }
+                    if let Err(e) = result {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                    if eof {
+                        return;
+                    }
+                }
+            })?;
+        Ok(Self {
+            blocks,
+            current: Vec::new(),
+            pos: 0,
+            done: false,
+        })
+    }
+}
+
+impl Read for ReadAhead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while self.pos == self.current.len() {
+            if self.done {
+                return Ok(0);
+            }
+            match self.blocks.recv() {
+                Ok(Ok(block)) => {
+                    self.current = block;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => {
+                    self.done = true;
+                    return Err(e);
+                }
+                // The thread exits after the last block (or an error).
+                Err(_) => {
+                    self.done = true;
+                    return Ok(0);
+                }
+            }
+        }
+        let n = buf.len().min(self.current.len() - self.pos);
+        buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_ahead_preserves_stream() {
+        let data: Vec<u8> = (0..READ_AHEAD_BLOCK * 3 + 12_345)
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let mut reader = ReadAhead::new(Box::new(io::Cursor::new(data.clone()))).unwrap();
+        let mut out = Vec::new();
+        // Odd-sized reads cross block boundaries.
+        let mut buf = [0u8; 7_777];
+        loop {
+            let n = reader.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn read_ahead_reports_errors() {
+        struct Failing(usize);
+        impl Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(io::Error::other("corrupt stream"));
+                }
+                let n = buf.len().min(self.0);
+                buf[..n].fill(1);
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        let mut reader = ReadAhead::new(Box::new(Failing(10))).unwrap();
+        let mut out = Vec::new();
+        let err = reader.read_to_end(&mut out).unwrap_err();
+        assert!(err.to_string().contains("corrupt stream"));
+        assert_eq!(out, vec![1u8; 10]);
+    }
 
     #[test]
     fn buffer_capacity_is_size_aware() {
