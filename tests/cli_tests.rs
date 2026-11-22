@@ -1294,3 +1294,133 @@ fn test_filter_selects_exact_entries_only() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+// ─── Zip encryption ─────────────────────────────────────────────────────────
+
+/// Plaintext that must never appear in an encrypted archive's bytes.
+const ZIP_SECRET_MARKER: &[u8] = b"OPENARCHIVE-PLAINTEXT-MARKER-7f3a";
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+#[test]
+fn test_zip_password_encrypts_entries() {
+    let dir = "test_zip_password";
+    let _ = fs::remove_dir_all(dir);
+    let src = format!("{dir}/src");
+    fs::create_dir_all(format!("{src}/sub")).unwrap();
+    // Several files so the batch paths have more than one batch to merge.
+    let mut files = Vec::new();
+    for i in 0..6 {
+        let mut payload = ZIP_SECRET_MARKER.to_vec();
+        payload.extend((0..64 * 1024).map(|j| ((i * 31 + j) % 251) as u8));
+        let rel = if i % 2 == 0 { format!("f{i}.bin") } else { format!("sub/f{i}.bin") };
+        fs::write(format!("{src}/{rel}"), &payload).unwrap();
+        files.push((rel, payload));
+    }
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    // (label, extra args, batch bytes): sequential; parallel in-memory batches;
+    // parallel batches spilled to temp files (batch limit below one file).
+    let cases: [(&str, &[&str], Option<&str>); 3] = [
+        ("sequential", &["-mmt=1"], None),
+        ("parallel", &["-mmt=4"], Some("150000")),
+        ("spill", &["-mmt=4"], Some("1000")),
+    ];
+
+    for (label, extra, batch_bytes) in cases {
+        for level in ["-mx=0", "-mx=5"] {
+            let archive = format!("{dir}/enc_{label}{level}.zip");
+            let mut create = Command::new(exe);
+            create
+                .current_dir(dir)
+                .args(["a", &archive[dir.len() + 1..], "src", "-psecret", level])
+                .args(extra);
+            if let Some(bytes) = batch_bytes {
+                create.env("OPENARCHIVE_ZIP_BATCH_BYTES", bytes);
+            }
+            assert!(create.output().unwrap().status.success(), "{label}{level}: create");
+
+            // No plaintext anywhere in the file, even when stored (-mx=0).
+            let bytes = fs::read(&archive).unwrap();
+            assert!(
+                !contains_bytes(&bytes, ZIP_SECRET_MARKER),
+                "{label}{level}: plaintext found in archive"
+            );
+
+            // Every file entry is encrypted.
+            let mut zip = zip::ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
+            let mut file_entries = 0;
+            for i in 0..zip.len() {
+                let entry = zip.by_index_raw(i).unwrap();
+                if !entry.is_dir() {
+                    assert!(entry.encrypted(), "{label}{level}: {} not encrypted", entry.name());
+                    file_entries += 1;
+                }
+            }
+            assert_eq!(file_entries, files.len(), "{label}{level}: entry count");
+
+            // Missing and wrong passwords fail.
+            let out = format!("{dir}/out_{label}{level}");
+            for password in [None, Some("-pwrong")] {
+                let _ = fs::remove_dir_all(&out);
+                let mut cmd = Command::new(exe);
+                cmd.args(["x", &archive, "-o", &out]);
+                if let Some(p) = password {
+                    cmd.arg(p);
+                }
+                assert!(
+                    !cmd.output().unwrap().status.success(),
+                    "{label}{level}: extraction with {password:?} should fail"
+                );
+            }
+            assert!(
+                !Command::new(exe).args(["t", &archive]).output().unwrap().status.success(),
+                "{label}{level}: test without password should fail"
+            );
+
+            // The right password round-trips every file.
+            let _ = fs::remove_dir_all(&out);
+            let status = Command::new(exe)
+                .args(["x", &archive, "-o", &out, "-psecret"])
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "{label}{level}: extract with password");
+            for (rel, payload) in &files {
+                assert_eq!(
+                    &fs::read(format!("{out}/src/{rel}")).unwrap(),
+                    payload,
+                    "{label}{level}: {rel}"
+                );
+            }
+            let tested = Command::new(exe).args(["t", &archive, "-psecret"]).output().unwrap();
+            assert!(tested.status.success(), "{label}{level}: test with password");
+        }
+    }
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_zip_empty_password_means_unencrypted() {
+    let dir = "test_zip_empty_password";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    fs::write(format!("{dir}/a.txt"), "plain").unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    let archive = format!("{dir}/plain.zip");
+    let status = Command::new(exe)
+        // `-p ""` yields an empty password (a bare trailing `-p=` yields none).
+        .args(["a", &archive, &format!("{dir}/a.txt"), "-p", ""])
+        .output()
+        .unwrap()
+        .status;
+    assert!(status.success());
+    let mut zip = zip::ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
+    assert!(!zip.by_index_raw(0).unwrap().encrypted());
+
+    let _ = fs::remove_dir_all(dir);
+}

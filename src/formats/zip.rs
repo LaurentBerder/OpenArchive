@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
 use walkdir::WalkDir;
-use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use zip::write::{FileOptions, SimpleFileOptions};
+use zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::core::io as file_io;
 use crate::core::paths;
@@ -331,7 +331,7 @@ impl ArchiveReader for ZipHandler {
 fn write_zip_batch<W: Write + Seek>(
     writer: &mut ZipWriter<W>,
     batch: &[ZipItem],
-    file_options: SimpleFileOptions,
+    file_options: FileOptions<'_, ()>,
 ) -> Result<()> {
     for item in batch {
         writer.start_file(item.name.clone(), file_options)?;
@@ -350,7 +350,7 @@ fn write_zip_batch<W: Write + Seek>(
 fn push_parallel_batches<W: Write + Seek>(
     writer: &mut ZipWriter<W>,
     batches: Vec<Vec<ZipItem>>,
-    file_options: SimpleFileOptions,
+    file_options: FileOptions<'_, ()>,
     worker_count: usize,
     spill_threshold: u64,
 ) -> Result<()> {
@@ -503,9 +503,19 @@ impl ArchiveWriter for ZipHandler {
             (CompressionMethod::Deflated, Some(options.level as i64))
         };
 
-        let file_options = SimpleFileOptions::default()
+        let base_options = SimpleFileOptions::default()
             .compression_method(method)
             .compression_level(comp_level);
+
+        // Every file entry is AES-256 encrypted when a password is given, as
+        // 7-Zip does with `-p` for zip. Directory entries carry no data and
+        // stay unencrypted. An empty password means no encryption, matching
+        // the 7z writer.
+        let file_options: FileOptions<'_, ()> =
+            match options.password.as_deref().filter(|p| !p.is_empty()) {
+                Some(password) => base_options.with_aes_encryption(AesMode::Aes256, password),
+                None => base_options,
+            };
 
         let dir_options =
             SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
