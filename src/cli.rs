@@ -14,7 +14,6 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CliArgs {
     pub command: Command,
     pub archive: PathBuf,

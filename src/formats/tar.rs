@@ -14,10 +14,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tar::{EntryType, Header};
-use walkdir::WalkDir;
 
 use super::stream_compress::{self, Codec, ParallelCompressor};
 use crate::core::io as file_io;
+use crate::core::filter::{self, EntryFilter};
+use crate::core::inputs::{self, Input};
 use crate::core::paths;
 use crate::core::{
     ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions, Progress,
@@ -68,7 +69,7 @@ impl TarHandler {
     fn try_extract_plain_parallel(
         &self,
         options: &ExtractOptions,
-        filter: Option<&[String]>,
+        filter: Option<&EntryFilter>,
         num_threads: usize,
     ) -> Result<bool> {
         if self.format != ArchiveFormat::Tar || options.flat {
@@ -97,7 +98,7 @@ impl TarHandler {
             }
             let name = entry.path()?.to_string_lossy().to_string();
 
-            if !paths::matches_filter(filter, &name) {
+            if !filter::selected(filter, &name) {
                 continue;
             }
 
@@ -260,7 +261,7 @@ impl ArchiveReader for TarHandler {
         Ok(entries)
     }
 
-    fn extract(&mut self, options: &ExtractOptions, filter: Option<&[String]>) -> Result<()> {
+    fn extract(&mut self, options: &ExtractOptions, filter: Option<&EntryFilter>) -> Result<()> {
         let num_threads = options.thread_count();
 
         if num_threads > 1 && self.try_extract_plain_parallel(options, filter, num_threads)? {
@@ -296,7 +297,7 @@ impl ArchiveReader for TarHandler {
             }
 
             let name = entry.path()?.to_string_lossy().to_string();
-            if !paths::matches_filter(filter, &name) {
+            if !filter::selected(filter, &name) {
                 continue;
             }
 
@@ -369,13 +370,19 @@ impl ArchiveReader for TarHandler {
         Ok(())
     }
 
-    fn test(&mut self, _password: Option<&str>, progress: Option<&Progress>) -> Result<()> {
+    fn test(&mut self, _password: Option<&str>, filter: Option<&EntryFilter>, progress: Option<&Progress>) -> Result<()> {
         let reader = self.open_reader()?;
         let mut archive = tar::Archive::new(reader);
 
         // Streamed: the total is unknown, so only bytes are reported.
         for entry in archive.entries()? {
             let mut entry = entry?;
+            if filter.is_some() {
+                let name = entry.path()?.to_string_lossy().into_owned();
+                if !filter::selected(filter, &name) {
+                    continue; // the tar reader skips unread data itself
+                }
+            }
             file_io::drain(&mut entry, progress)?;
         }
 
@@ -404,7 +411,7 @@ fn warn(options: &ExtractOptions, message: String) {
 }
 
 impl ArchiveWriter for TarHandler {
-    fn create(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
+    fn create(archive_path: &Path, files: &[Input], options: &CompressionOptions) -> Result<()> {
         let file = File::create(archive_path)
             .with_context(|| format!("Failed to create archive: {}", archive_path.display()))?;
         let buf_file = BufWriter::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
@@ -414,41 +421,11 @@ impl ArchiveWriter for TarHandler {
 
         let mut builder = tar::Builder::new(writer);
 
-        for target in files {
-            let Ok(target_meta) = target.metadata() else {
-                continue;
-            };
-
-            if target_meta.is_dir() {
-                let base = target.parent().unwrap_or(target);
-                for entry in WalkDir::new(target) {
-                    let entry = entry?;
-                    let path = entry.path();
-                    let rel_path = path.strip_prefix(base).unwrap_or(path);
-                    let rel_name = rel_path.to_string_lossy().replace('\\', "/");
-                    let file_type = entry.file_type();
-
-                    if file_type.is_dir() {
-                        let metadata = entry.metadata()?;
-                        append_tar_dir(&mut builder, &rel_name, &metadata)?;
-                    } else if file_type.is_file() {
-                        append_tar_file(&mut builder, &rel_name, path)?;
-                    } else if file_type.is_symlink() {
-                        if path.is_dir() {
-                            let metadata = path.metadata()?;
-                            append_tar_dir(&mut builder, &rel_name, &metadata)?;
-                        } else if path.is_file() {
-                            append_tar_file(&mut builder, &rel_name, path)?;
-                        }
-                    }
-                }
-            } else if target_meta.is_file() {
-                let file_name = target
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                append_tar_file(&mut builder, &file_name, target)?;
+        for source in inputs::sources(files)? {
+            if source.is_dir {
+                append_tar_dir(&mut builder, &source.name, &source.metadata)?;
+            } else {
+                append_tar_file(&mut builder, &source.name, &source.path)?;
             }
         }
 

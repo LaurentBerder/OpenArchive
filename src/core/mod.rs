@@ -4,11 +4,15 @@ use std::sync::Arc;
 
 pub mod conflict;
 mod detect;
+pub mod filter;
+pub mod inputs;
 pub(crate) mod io;
 pub(crate) mod paths;
 pub mod progress;
 
 pub use conflict::{Aborted, Conflicts, Decision, OverwriteMode, Prompter};
+pub use filter::EntryFilter;
+pub use inputs::{Expanded, Input};
 pub use progress::{Cancelled, Progress};
 
 /// Logical CPUs available to this process (at least 1).
@@ -164,17 +168,23 @@ pub trait ArchiveReader {
     fn extract(
         &mut self,
         options: &ExtractOptions,
-        filter: Option<&[String]>,
+        filter: Option<&EntryFilter>,
     ) -> anyhow::Result<()>;
-    /// Decompresses every entry and verifies it. `progress`, if given,
-    /// receives the bytes verified and can cancel the test.
-    fn test(&mut self, password: Option<&str>, progress: Option<&Progress>) -> anyhow::Result<()>;
+    /// Decompresses the entries `filter` selects (all without one) and
+    /// verifies them. `progress`, if given, receives the bytes verified and
+    /// can cancel the test.
+    fn test(
+        &mut self,
+        password: Option<&str>,
+        filter: Option<&EntryFilter>,
+        progress: Option<&Progress>,
+    ) -> anyhow::Result<()>;
 }
 
 pub trait ArchiveWriter {
     fn create(
         archive_path: &Path,
-        files: &[PathBuf],
+        files: &[Input],
         options: &CompressionOptions,
     ) -> anyhow::Result<()>;
 }

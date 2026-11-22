@@ -6,7 +6,7 @@ pub(crate) mod stream_compress;
 use std::path::{Path, PathBuf};
 use anyhow::Result;
 
-use crate::core::{ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions};
+use crate::core::{ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, EntryFilter, Input};
 use self::sevenz::SevenZHandler;
 use self::zip::ZipHandler;
 use self::tar::TarHandler;
@@ -25,7 +25,15 @@ pub fn get_reader<P: AsRef<Path>>(path: P, password: Option<String>) -> Result<B
     }
 }
 
+/// Creates `archive_path` from files and folders, each stored under its own
+/// name (see [`Input::new`]).
 pub fn create_archive(archive_path: &Path, files: &[PathBuf], options: &CompressionOptions) -> Result<()> {
+    let inputs: Vec<Input> = files.iter().map(Input::new).collect();
+    create_archive_from(archive_path, &inputs, options)
+}
+
+/// Creates `archive_path` from inputs with explicit archive names.
+pub fn create_archive_from(archive_path: &Path, files: &[Input], options: &CompressionOptions) -> Result<()> {
     let format = ArchiveFormat::from_path(archive_path)
         .ok_or_else(|| anyhow::anyhow!("Cannot determine archive format from name: {}", archive_path.display()))?;
 
@@ -105,12 +113,12 @@ pub fn existing_targets(
     archive: &Path,
     password: Option<String>,
     options: &crate::core::ExtractOptions,
-    filter: Option<&[String]>,
+    filter: Option<&EntryFilter>,
 ) -> Result<Vec<PathBuf>> {
     let entries = get_reader(archive, password)?.list()?;
     let mut existing = Vec::new();
     for entry in entries.iter().filter(|entry| !entry.is_dir) {
-        if !crate::core::paths::matches_filter(filter, &entry.name) {
+        if !crate::core::filter::selected(filter, &entry.name) {
             continue;
         }
         if let Some(target) = crate::core::paths::entry_target(&options.output_dir, &entry.name, options.flat)?
@@ -314,11 +322,26 @@ mod tests {
     }
 
     #[test]
+    fn test_checks_only_the_selected_entries() {
+        for ext in ["zip", "7z", "tar.gz"] {
+            let (dir, archive) = progress_archive(&format!("progf-{}", ext.replace('.', "")), ext, None);
+            let progress = Progress::new();
+            let filter = EntryFilter::patterns(["*.txt"], true);
+            get_reader(&archive, None).unwrap().test(None, Some(&filter), Some(&progress)).unwrap();
+            assert_eq!(progress.done(), 10_000, "{ext}: only src/a.txt is read");
+            if ext != "tar.gz" {
+                assert_eq!(progress.total(), Some(10_000), "{ext}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
     fn test_reports_progress() {
         for ext in ["zip", "7z", "tar.gz"] {
             let (dir, archive) = progress_archive(&format!("progt-{}", ext.replace('.', "")), ext, None);
             let progress = Progress::new();
-            get_reader(&archive, None).unwrap().test(None, Some(&progress)).unwrap();
+            get_reader(&archive, None).unwrap().test(None, None, Some(&progress)).unwrap();
             assert_eq!(progress.done(), PAYLOAD_BYTES, "{ext}");
             if ext != "tar.gz" {
                 assert_eq!(progress.total(), Some(PAYLOAD_BYTES), "{ext}");
@@ -349,7 +372,7 @@ mod tests {
             let (dir, archive) = progress_archive(&format!("cancelt-{}", ext.replace('.', "")), ext, None);
             let progress = Progress::new();
             progress.cancel();
-            let err = get_reader(&archive, None).unwrap().test(None, Some(&progress)).unwrap_err();
+            let err = get_reader(&archive, None).unwrap().test(None, None, Some(&progress)).unwrap_err();
             assert!(is_cancelled(&err), "{ext}: {err:#}");
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -580,7 +603,7 @@ mod tests {
         let options = ExtractOptions { output_dir: out.clone(), ..Default::default() };
 
         assert_eq!(existing_targets(&archive, None, &options, None).unwrap(), [out.join("src").join("a.txt")]);
-        let filter = ["src/big.bin".to_string()];
+        let filter = EntryFilter::paths(["src/big.bin"]);
         assert!(existing_targets(&archive, None, &options, Some(&filter)).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
