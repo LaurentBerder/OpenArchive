@@ -53,6 +53,8 @@ enum ArchiveOp {
     ExtractItem { full_internal: String, name: String, is_dir: bool, dest: PathBuf },
     /// Extract the whole archive into `dest`.
     ExtractAll { dest: PathBuf },
+    /// Decompress every entry and verify its checksum, writing nothing.
+    Test,
 }
 
 /// State of the "password required" dialog.
@@ -371,6 +373,10 @@ impl OpenArchiveGui {
             ArchiveOp::Preview { file_name, .. } => format!("Failed to open {file_name}: {err:#}"),
             ArchiveOp::ExtractItem { name, .. } => format!("Failed to extract {name}: {err:#}"),
             ArchiveOp::ExtractAll { .. } => format!("Extraction failed: {err:#}"),
+            ArchiveOp::Test => format!(
+                "Test failed for {}: {err:#}",
+                archive_path.file_name().unwrap_or_default().to_string_lossy()
+            ),
         };
         if op == ArchiveOp::List {
             self.status_message = message.clone();
@@ -434,6 +440,13 @@ impl OpenArchiveGui {
             ArchiveOp::ExtractAll { dest } => {
                 reader.extract(&extract_options(dest.clone(), false), None)?;
                 self.show_notification(format!("Extracted to {}", dest.display()));
+            }
+            ArchiveOp::Test => {
+                reader.test(password.as_deref())?;
+                self.show_notification(format!(
+                    "{}: Everything is Ok",
+                    archive_path.file_name().unwrap_or_default().to_string_lossy()
+                ));
             }
         }
         Ok(())
@@ -629,6 +642,14 @@ impl OpenArchiveGui {
             }
         }
     }
+
+    /// Tests the integrity of the archive currently shown.
+    fn test_current(&mut self) {
+        if let NavLocation::Archive { archive_path, .. } = &self.current_location {
+            let arc = archive_path.clone();
+            self.run_archive_op(arc, ArchiveOp::Test);
+        }
+    }
 }
 
 /// Full path of `name` inside an archive, given the folder shown in the GUI.
@@ -809,7 +830,7 @@ impl eframe::App for OpenArchiveGui {
                     self.extract_current();
                 }
                 if ui.add_enabled(can_extract, egui::Button::new(RichText::new("✔ Test").size(14.0))).clicked() {
-                    self.show_notification("Archive testing: Everything is Ok");
+                    self.test_current();
                 }
 
                 ui.separator();
@@ -1292,6 +1313,79 @@ mod tests {
         assert!(app.password_prompt.is_none());
         assert!(app.status_message.starts_with("Failed to open archive"), "{}", app.status_message);
         assert!(app.notification.is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn notification_text(app: &OpenArchiveGui) -> &str {
+        app.notification.as_ref().map(|(text, _)| text.as_str()).unwrap_or("")
+    }
+
+    /// Stores `src/a.txt` uncompressed in a `.{ext}` archive, then flips one
+    /// byte of its data so the headers still parse but the checksum fails.
+    fn make_corrupt_archive(tag: &str, ext: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("openarchive-gui-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/a.txt"), PAYLOAD).unwrap();
+        let archive = dir.join(format!("corrupt.{ext}"));
+        let options = CompressionOptions { level: 0, ..Default::default() };
+        create_archive(&archive, &[dir.join("src")], &options).unwrap();
+
+        let mut bytes = fs::read(&archive).unwrap();
+        let at = bytes
+            .windows(PAYLOAD.len())
+            .position(|window| window == PAYLOAD)
+            .expect("stored payload should appear verbatim");
+        bytes[at] ^= 0xFF;
+        fs::write(&archive, bytes).unwrap();
+        (dir, archive)
+    }
+
+    #[test]
+    fn test_button_reports_a_healthy_archive() {
+        let (dir, archive) = make_archive("test-ok", None);
+        let mut app = open_at(&archive);
+
+        app.test_current();
+        assert!(app.password_prompt.is_none());
+        assert!(notification_text(&app).ends_with("Everything is Ok"), "{}", notification_text(&app));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_button_reports_corruption() {
+        for ext in ["zip", "7z"] {
+            let (dir, archive) = make_corrupt_archive(&format!("test-bad-{ext}"), ext);
+            let mut app = open_at(&archive);
+            // Headers are intact, so the archive still opens and lists.
+            assert_eq!(item_names(&app), ["src"], "{ext}");
+
+            app.test_current();
+            assert!(app.password_prompt.is_none(), "{ext}");
+            assert!(
+                notification_text(&app).starts_with("Test failed for corrupt."),
+                "{ext}: {}",
+                notification_text(&app)
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn test_button_prompts_for_encrypted_archive() {
+        let (dir, archive) = make_archive("test-enc", Some("right"));
+        // Start on disk so no password is cached yet.
+        let mut app = OpenArchiveGui::with_location(NavLocation::Disk(dir.clone()));
+
+        app.run_archive_op(archive.clone(), ArchiveOp::Test);
+        assert_eq!(app.password_prompt.as_ref().unwrap().op, ArchiveOp::Test);
+
+        enter_password(&mut app, "right");
+        assert!(app.password_prompt.is_none());
+        assert!(notification_text(&app).ends_with("Everything is Ok"), "{}", notification_text(&app));
 
         let _ = fs::remove_dir_all(&dir);
     }
