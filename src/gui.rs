@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, TryRecvError};
+use std::time::Instant;
 use eframe::egui::{self, Color32, FontId, Key, PointerButton, Rect, RichText, Sense, Vec2};
 
 use crate::core::{ArchiveEntry, ArchiveFormat, ExtractOptions};
@@ -55,6 +57,41 @@ enum ArchiveOp {
     ExtractAll { dest: PathBuf },
     /// Decompress every entry and verify its checksum, writing nothing.
     Test,
+}
+
+/// What a finished background operation hands back to the UI thread.
+#[derive(Debug)]
+enum OpOutcome {
+    /// `ArchiveOp::List`: every entry of the archive.
+    Listed(Vec<ArchiveEntry>),
+    /// `ArchiveOp::Preview`: the extracted file, to open on the UI thread.
+    Previewed(PathBuf),
+    /// Extraction or test finished; nothing to hand back.
+    Done,
+}
+
+/// An archive operation running on a worker thread.
+struct RunningOp {
+    archive_path: PathBuf,
+    op: ArchiveOp,
+    /// The password it was started with, to tell a missing from a wrong one.
+    password: Option<String>,
+    started: Instant,
+    result: mpsc::Receiver<anyhow::Result<OpOutcome>>,
+}
+
+impl RunningOp {
+    /// Short description for the status bar, e.g. "Extracting archive.7z".
+    fn label(&self) -> String {
+        let archive = self.archive_path.file_name().unwrap_or_default().to_string_lossy();
+        match &self.op {
+            ArchiveOp::List => format!("Opening {archive}"),
+            ArchiveOp::Preview { file_name, .. } => format!("Opening {file_name}"),
+            ArchiveOp::ExtractItem { name, .. } => format!("Extracting {name}"),
+            ArchiveOp::ExtractAll { .. } => format!("Extracting {archive}"),
+            ArchiveOp::Test => format!("Testing {archive}"),
+        }
+    }
 }
 
 /// State of the "password required" dialog.
@@ -122,6 +159,11 @@ pub struct OpenArchiveGui {
     passwords: HashMap<PathBuf, String>,
     /// Open "password required" dialog, if any.
     password_prompt: Option<PasswordPrompt>,
+
+    /// Archive operations running on worker threads (OA-5).
+    running_ops: Vec<RunningOp>,
+    /// Wakes the UI when a worker finishes; `None` without a window (tests).
+    repaint: Option<egui::Context>,
 }
 
 // ─── Platform helpers ─────────────────────────────────────────────────────────
@@ -267,13 +309,14 @@ mod shell_open {
 // ─── App impl ─────────────────────────────────────────────────────────────────
 
 impl OpenArchiveGui {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let initial = NavLocation::Disk(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        Self::with_location(initial)
+        Self::with_location(initial, Some(cc.egui_ctx.clone()))
     }
 
-    /// Builds the app state at `initial` without any UI context.
-    fn with_location(initial: NavLocation) -> Self {
+    /// Builds the app state at `initial`. `repaint` wakes the window when a
+    /// background operation finishes; tests pass `None`.
+    fn with_location(initial: NavLocation, repaint: Option<egui::Context>) -> Self {
         let mut app = Self {
             current_location: initial.clone(),
             history_back: Vec::new(),
@@ -289,6 +332,8 @@ impl OpenArchiveGui {
             properties_item: None,
             passwords: HashMap::new(),
             password_prompt: None,
+            running_ops: Vec::new(),
+            repaint,
         };
         app.refresh_items();
         app
@@ -549,23 +594,105 @@ impl OpenArchiveGui {
 
     // ─── Archive operations ──────────────────────────────────────────────────
 
-    /// Runs `op` on `archive_path` with the password remembered for it.
+    /// Starts `op` on `archive_path` on a worker thread, with the password
+    /// remembered for that archive, so the window stays responsive. The
+    /// result is applied by [`Self::poll_running_ops`], called every frame.
+    fn run_archive_op(&mut self, archive_path: PathBuf, op: ArchiveOp) {
+        let password = self.passwords.get(&archive_path).cloned();
+        let (tx, rx) = mpsc::channel();
+        let repaint = self.repaint.clone();
+        let (job_path, job_op, job_password) = (archive_path.clone(), op.clone(), password.clone());
+        std::thread::spawn(move || {
+            let result = perform_archive_op(&job_path, &job_op, job_password);
+            // The receiver is gone only if the app closed; nothing to do then.
+            let _ = tx.send(result);
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
+        });
+
+        let running = RunningOp { archive_path, op, password, started: Instant::now(), result: rx };
+        if running.op == ArchiveOp::List {
+            self.status_message = format!("{}…", running.label());
+        }
+        self.running_ops.push(running);
+    }
+
+    /// Applies the results of background operations that have finished.
+    fn poll_running_ops(&mut self) {
+        let mut finished = Vec::new();
+        self.running_ops.retain(|running| {
+            let result = match running.result.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return true,
+                // The worker died without answering (it panicked).
+                Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("the operation stopped unexpectedly")),
+            };
+            finished.push((running.archive_path.clone(), running.op.clone(), running.password.clone(), result));
+            false
+        });
+        for (archive_path, op, password, result) in finished {
+            self.finish_archive_op(archive_path, op, password, result);
+        }
+    }
+
+    /// Test helper: applies background results until none are running.
+    #[cfg(test)]
+    fn wait_idle(&mut self) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while !self.running_ops.is_empty() {
+            assert!(Instant::now() < deadline, "background operation did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            self.poll_running_ops();
+        }
+    }
+
+    /// Whether an extraction or test is running on `archive_path`.
+    fn archive_busy(&self, archive_path: &Path) -> bool {
+        self.running_ops
+            .iter()
+            .any(|running| running.op != ArchiveOp::List && running.archive_path == archive_path)
+    }
+
+    /// Status-bar text for the operations in progress, if any.
+    fn busy_label(&self) -> Option<String> {
+        let first = self.running_ops.first()?;
+        let mut label = format!("{}… {}s", first.label(), first.started.elapsed().as_secs());
+        if self.running_ops.len() > 1 {
+            label.push_str(&format!(" (+{} more)", self.running_ops.len() - 1));
+        }
+        Some(label)
+    }
+
+    /// Applies the result of a finished operation on the UI thread.
     ///
     /// If the archive needs a password, or the remembered one is wrong, the
     /// password dialog is opened and `op` is retried when the user submits it.
     /// Other failures are reported in a notification.
-    fn run_archive_op(&mut self, archive_path: PathBuf, op: ArchiveOp) {
-        let password = self.passwords.get(&archive_path).cloned();
-        let Err(err) = self.execute_archive_op(&archive_path, &op, password.clone()) else {
-            return;
+    fn finish_archive_op(
+        &mut self,
+        archive_path: PathBuf,
+        op: ArchiveOp,
+        password: Option<String>,
+        result: anyhow::Result<OpOutcome>,
+    ) {
+        let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let err = match result {
+            Ok(outcome) => {
+                self.apply_outcome(&archive_path, &op, outcome);
+                return;
+            }
+            Err(err) => err,
         };
 
         if password_problem(&err).is_some() {
             self.passwords.remove(&archive_path);
-            self.status_message = format!(
-                "Password required: {}",
-                archive_path.file_name().unwrap_or_default().to_string_lossy()
-            );
+            if self.password_prompt.is_some() {
+                // One dialog at a time: report this one, the user can retry.
+                self.show_notification(format!("Password required for {archive_name}; try again"));
+                return;
+            }
+            self.status_message = format!("Password required: {archive_name}");
             self.password_prompt = Some(PasswordPrompt {
                 archive_path,
                 op,
@@ -580,87 +707,57 @@ impl OpenArchiveGui {
             ArchiveOp::Preview { file_name, .. } => format!("Failed to open {file_name}: {err:#}"),
             ArchiveOp::ExtractItem { name, .. } => format!("Failed to extract {name}: {err:#}"),
             ArchiveOp::ExtractAll { .. } => format!("Extraction failed: {err:#}"),
-            ArchiveOp::Test => format!(
-                "Test failed for {}: {err:#}",
-                archive_path.file_name().unwrap_or_default().to_string_lossy()
-            ),
+            ArchiveOp::Test => format!("Test failed for {archive_name}: {err:#}"),
         };
-        if op == ArchiveOp::List {
+        if op == ArchiveOp::List && self.shows_archive(&archive_path) {
             self.status_message = message.clone();
         }
         self.show_notification(message);
     }
 
-    fn execute_archive_op(
-        &mut self,
-        archive_path: &Path,
-        op: &ArchiveOp,
-        password: Option<String>,
-    ) -> anyhow::Result<()> {
-        let mut reader = get_reader(archive_path, password.clone())?;
-        let extract_options = |output_dir: PathBuf, flat: bool| ExtractOptions {
-            output_dir,
-            flat,
-            password: password.clone(),
-            overwrite: true,
-            threads: None,
-        };
+    /// Whether the archive at `archive_path` is the one currently shown.
+    fn shows_archive(&self, archive_path: &Path) -> bool {
+        matches!(&self.current_location, NavLocation::Archive { archive_path: current, .. } if current == archive_path)
+    }
 
-        match op {
-            ArchiveOp::List => {
-                // The user may have navigated away while the dialog was open.
+    fn apply_outcome(&mut self, archive_path: &Path, op: &ArchiveOp, outcome: OpOutcome) {
+        let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        match (op, outcome) {
+            (ArchiveOp::List, OpOutcome::Listed(entries)) => {
+                // The user may have navigated away while it was listing.
                 let NavLocation::Archive { archive_path: current, internal_prefix } = &self.current_location
                 else {
-                    return Ok(());
+                    return;
                 };
                 if current != archive_path {
-                    return Ok(());
+                    return;
                 }
-                let entries = reader.list()?;
                 self.items = filter_archive_entries(&entries, internal_prefix);
                 self.sort_items();
-                self.status_message = format!(
-                    "Archive: {} [{} items]",
-                    archive_path.file_name().unwrap_or_default().to_string_lossy(),
-                    self.items.len()
-                );
+                self.status_message = format!("Archive: {archive_name} [{} items]", self.items.len());
             }
-            ArchiveOp::Preview { full_internal, file_name, open_with } => {
-                let arc_stem = archive_path.file_stem().unwrap_or_default().to_string_lossy();
-                let temp_dir = std::env::temp_dir().join("OpenArchive").join(arc_stem.as_ref());
-                fs::create_dir_all(&temp_dir)?;
-                let filter = [full_internal.clone()];
-                reader.extract(&extract_options(temp_dir.clone(), true), Some(&filter))?;
-
-                let target_file = temp_dir.join(file_name);
-                if !target_file.exists() {
-                    anyhow::bail!("{full_internal} was not found in the archive");
-                }
-                if *open_with {
-                    open_with_dialog(&target_file)?;
+            (ArchiveOp::Preview { file_name, open_with, .. }, OpOutcome::Previewed(target_file)) => {
+                let opened = if *open_with {
+                    open_with_dialog(&target_file)
                 } else {
-                    open_file_externally(&target_file)?;
+                    open_file_externally(&target_file)
+                };
+                match opened {
+                    Ok(()) => self.show_notification(format!("Opened {file_name}")),
+                    Err(err) => self.show_notification(format!("Failed to open {file_name}: {err}")),
                 }
-                self.show_notification(format!("Opened {file_name}"));
             }
-            ArchiveOp::ExtractItem { full_internal, name, is_dir, dest } => {
-                let filter = [full_internal.clone()];
-                reader.extract(&extract_options(dest.clone(), !is_dir), Some(&filter))?;
+            (ArchiveOp::ExtractItem { name, dest, .. }, OpOutcome::Done) => {
                 self.show_notification(format!("Extracted {} to {}", name, dest.display()));
             }
-            ArchiveOp::ExtractAll { dest } => {
-                reader.extract(&extract_options(dest.clone(), false), None)?;
+            (ArchiveOp::ExtractAll { dest }, OpOutcome::Done) => {
                 self.show_notification(format!("Extracted to {}", dest.display()));
             }
-            ArchiveOp::Test => {
-                reader.test(password.as_deref())?;
-                self.show_notification(format!(
-                    "{}: Everything is Ok",
-                    archive_path.file_name().unwrap_or_default().to_string_lossy()
-                ));
+            (ArchiveOp::Test, OpOutcome::Done) => {
+                self.show_notification(format!("{archive_name}: Everything is Ok"));
             }
+            (op, outcome) => unreachable!("{op:?} cannot produce {outcome:?}"),
         }
-        Ok(())
     }
 
     /// Retries the pending operation with the password typed in the dialog.
@@ -921,6 +1018,49 @@ fn copy_to_folder(source: &Path, dest_dir: &Path) -> std::io::Result<usize> {
     Ok(files)
 }
 
+/// Does the slow part of `op` on a worker thread. Touches no app state:
+/// everything the UI needs comes back in the [`OpOutcome`].
+fn perform_archive_op(archive_path: &Path, op: &ArchiveOp, password: Option<String>) -> anyhow::Result<OpOutcome> {
+    let mut reader = get_reader(archive_path, password.clone())?;
+    let extract_options = |output_dir: PathBuf, flat: bool| ExtractOptions {
+        output_dir,
+        flat,
+        password: password.clone(),
+        overwrite: true,
+        threads: None,
+    };
+
+    match op {
+        ArchiveOp::List => Ok(OpOutcome::Listed(reader.list()?)),
+        ArchiveOp::Preview { full_internal, file_name, .. } => {
+            let arc_stem = archive_path.file_stem().unwrap_or_default().to_string_lossy();
+            let temp_dir = std::env::temp_dir().join("OpenArchive").join(arc_stem.as_ref());
+            fs::create_dir_all(&temp_dir)?;
+            let filter = [full_internal.clone()];
+            reader.extract(&extract_options(temp_dir.clone(), true), Some(&filter))?;
+
+            let target_file = temp_dir.join(file_name);
+            if !target_file.exists() {
+                anyhow::bail!("{full_internal} was not found in the archive");
+            }
+            Ok(OpOutcome::Previewed(target_file))
+        }
+        ArchiveOp::ExtractItem { full_internal, is_dir, dest, .. } => {
+            let filter = [full_internal.clone()];
+            reader.extract(&extract_options(dest.clone(), !is_dir), Some(&filter))?;
+            Ok(OpOutcome::Done)
+        }
+        ArchiveOp::ExtractAll { dest } => {
+            reader.extract(&extract_options(dest.clone(), false), None)?;
+            Ok(OpOutcome::Done)
+        }
+        ArchiveOp::Test => {
+            reader.test(password.as_deref())?;
+            Ok(OpOutcome::Done)
+        }
+    }
+}
+
 /// Full path of `name` inside an archive, given the folder shown in the GUI.
 fn archive_item_path(internal_prefix: &str, name: &str) -> String {
     format!("{}{}", internal_prefix.replace('\\', "/"), name)
@@ -980,6 +1120,13 @@ impl eframe::App for OpenArchiveGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut to_open: Option<DisplayItem> = None;
         let mut action_to_take: Option<ContextAction> = None;
+
+        // ── 0. BACKGROUND OPERATIONS ─────────────────────────────────────────
+        self.poll_running_ops();
+        if !self.running_ops.is_empty() {
+            // Keep the elapsed time ticking; workers also wake the UI when done.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
 
         // Grab modifier state for use in item rows below
         let (ctrl_down, shift_down) = ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
@@ -1077,7 +1224,11 @@ impl eframe::App for OpenArchiveGui {
                     self.show_notification("Select files to add into an archive");
                 }
 
-                let can_extract = matches!(self.current_location, NavLocation::Archive { .. });
+                // Not while this archive is already being extracted or tested.
+                let can_extract = match &self.current_location {
+                    NavLocation::Archive { archive_path, .. } => !self.archive_busy(archive_path),
+                    NavLocation::Disk(_) => false,
+                };
                 if ui.add_enabled(can_extract, egui::Button::new(RichText::new("📤 Extract").size(14.0))).clicked() {
                     self.extract_current();
                 }
@@ -1131,6 +1282,11 @@ impl eframe::App for OpenArchiveGui {
         // ── 3. BOTTOM STATUS BAR ──────────────────────────────────────────────
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if let Some(busy) = self.busy_label() {
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.label(RichText::new(busy).size(12.0).color(Color32::from_rgb(40, 180, 240)));
+                    ui.separator();
+                }
                 ui.label(RichText::new(&self.status_message).size(12.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
@@ -1445,11 +1601,14 @@ mod tests {
         (dir, archive)
     }
 
+    /// Opens the GUI on `archive` and waits for the listing to finish.
     fn open_at(archive: &Path) -> OpenArchiveGui {
-        OpenArchiveGui::with_location(NavLocation::Archive {
-            archive_path: archive.to_path_buf(),
-            internal_prefix: String::new(),
-        })
+        let mut app = OpenArchiveGui::with_location(
+            NavLocation::Archive { archive_path: archive.to_path_buf(), internal_prefix: String::new() },
+            None,
+        );
+        app.wait_idle();
+        app
     }
 
     fn item_names(app: &OpenArchiveGui) -> Vec<&str> {
@@ -1459,6 +1618,7 @@ mod tests {
     fn enter_password(app: &mut OpenArchiveGui, password: &str) {
         app.password_prompt.as_mut().expect("password prompt should be open").input = password.into();
         app.submit_password();
+        app.wait_idle();
     }
 
     #[test]
@@ -1483,11 +1643,13 @@ mod tests {
         // The password is remembered while browsing the same archive.
         let src = app.items[0].clone();
         app.open_item(src);
+        app.wait_idle();
         assert!(app.password_prompt.is_none());
         assert_eq!(item_names(&app), ["a.txt"]);
 
         let dest = dir.join("all");
         app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dest.clone() });
+        app.wait_idle();
         assert!(app.password_prompt.is_none());
         assert_eq!(fs::read(dest.join("src/a.txt")).unwrap(), PAYLOAD);
 
@@ -1497,7 +1659,7 @@ mod tests {
     #[test]
     fn extract_item_prompts_and_retries() {
         let (dir, archive) = make_archive("item", Some("right"));
-        let mut app = OpenArchiveGui::with_location(NavLocation::Disk(dir.clone()));
+        let mut app = OpenArchiveGui::with_location(NavLocation::Disk(dir.clone()), None);
         let dest = dir.join("one");
         let op = ArchiveOp::ExtractItem {
             full_internal: "src/a.txt".into(),
@@ -1507,6 +1669,8 @@ mod tests {
         };
 
         app.run_archive_op(archive.clone(), op.clone());
+
+        app.wait_idle();
         assert_eq!(app.password_prompt.as_ref().unwrap().op, op);
 
         enter_password(&mut app, "right");
@@ -1584,6 +1748,8 @@ mod tests {
         let mut app = open_at(&archive);
 
         app.test_current();
+
+        app.wait_idle();
         assert!(app.password_prompt.is_none());
         assert!(notification_text(&app).ends_with("Everything is Ok"), "{}", notification_text(&app));
 
@@ -1599,6 +1765,8 @@ mod tests {
             assert_eq!(item_names(&app), ["src"], "{ext}");
 
             app.test_current();
+
+            app.wait_idle();
             assert!(app.password_prompt.is_none(), "{ext}");
             assert!(
                 notification_text(&app).starts_with("Test failed for corrupt."),
@@ -1614,15 +1782,76 @@ mod tests {
     fn test_button_prompts_for_encrypted_archive() {
         let (dir, archive) = make_archive("test-enc", Some("right"));
         // Start on disk so no password is cached yet.
-        let mut app = OpenArchiveGui::with_location(NavLocation::Disk(dir.clone()));
+        let mut app = OpenArchiveGui::with_location(NavLocation::Disk(dir.clone()), None);
 
         app.run_archive_op(archive.clone(), ArchiveOp::Test);
+        app.wait_idle();
         assert_eq!(app.password_prompt.as_ref().unwrap().op, ArchiveOp::Test);
 
         enter_password(&mut app, "right");
         assert!(app.password_prompt.is_none());
         assert!(notification_text(&app).ends_with("Everything is Ok"), "{}", notification_text(&app));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Background operations (OA-5) ─────────────────────────────────────────
+
+    #[test]
+    fn operations_return_immediately_and_finish_in_the_background() {
+        let (dir, archive) = make_archive("bg", None);
+        let mut app = open_at(&archive);
+        let dest = dir.join("bg-out");
+
+        app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dest.clone() });
+        // The call returned without applying anything: the result is only
+        // picked up by the per-frame poll.
+        assert_eq!(app.running_ops.len(), 1);
+        assert!(app.archive_busy(&archive), "Extract/Test must be disabled meanwhile");
+        let busy = app.busy_label().expect("status bar shows the operation");
+        assert!(busy.starts_with("Extracting archive.7z…"), "{busy}");
+
+        app.wait_idle();
+        assert!(app.busy_label().is_none());
+        assert!(!app.archive_busy(&archive));
+        assert_eq!(fs::read(dest.join("src/a.txt")).unwrap(), PAYLOAD);
+        assert!(notification_text(&app).starts_with("Extracted to"), "{}", notification_text(&app));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listing_finished_after_leaving_the_archive_is_discarded() {
+        let (dir, archive) = make_archive("stale", None);
+        // Start listing the archive, then go to the folder before it finishes.
+        let mut app = OpenArchiveGui::with_location(
+            NavLocation::Archive { archive_path: archive.clone(), internal_prefix: String::new() },
+            None,
+        );
+        app.navigate_to(NavLocation::Disk(dir.clone()));
+        app.wait_idle();
+
+        // The folder's contents, not the archive's.
+        let mut names = item_names(&app);
+        names.sort_unstable();
+        assert_eq!(names, ["archive.7z", "src"]);
+        assert!(app.status_message.ends_with("items"), "{}", app.status_message);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn busy_label_counts_concurrent_operations() {
+        let (dir, archive) = make_archive("many", None);
+        let mut app = open_at(&archive);
+
+        app.run_archive_op(archive.clone(), ArchiveOp::Test);
+        app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dir.join("many-out") });
+        let busy = app.busy_label().unwrap();
+        assert!(busy.starts_with("Testing archive.7z…") && busy.ends_with("(+1 more)"), "{busy}");
+
+        app.wait_idle();
+        assert!(app.busy_label().is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 }
@@ -1672,7 +1901,7 @@ mod keyboard_tests {
         for i in 0..files {
             fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
         }
-        let app = OpenArchiveGui::with_location(NavLocation::Disk(dir.clone()));
+        let app = OpenArchiveGui::with_location(NavLocation::Disk(dir.clone()), None);
         (dir, app)
     }
 
@@ -1924,7 +2153,7 @@ mod disk_copy_tests {
     #[test]
     fn unreadable_folder_reports_an_error() {
         let missing = scratch("missing").join("does-not-exist");
-        let app = OpenArchiveGui::with_location(NavLocation::Disk(missing));
+        let app = OpenArchiveGui::with_location(NavLocation::Disk(missing), None);
         assert!(app.items.is_empty());
         assert!(app.status_message.starts_with("Cannot read"), "{}", app.status_message);
         assert!(app.notification.is_some());
