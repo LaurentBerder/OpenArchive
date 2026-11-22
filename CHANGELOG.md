@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Wildcards `*` and `?` in file names for every command, also on Windows where the shell does not expand them: `a` picks the files to add (stored without the folder part, like 7-Zip), `x`, `e`, `l` and `t` pick archive entries. Case-insensitive on Windows only.
+- `-r` now makes wildcards also match in subfolders (`-r-`: top level only); it was parsed but ignored before.
+- Overwrite handling: the CLI asks for each existing file like 7-Zip (Yes / No / Always / Skip all / Auto rename all / Quit; exit code 255 on Quit) and never blocks without a terminal; `-y` and `-aoa` overwrite, `-aos` skips, `-aou` renames the new file. The GUI asks once before extracting: Overwrite all / Skip existing / Keep both / Cancel.
+- `.tar.xz` / `.txz` archives (single- and multi-threaded xz).
+- GUI: progress percentage and a Cancel button for long operations, which now run in the background; quitting during one asks for confirmation.
+- GUI: password prompt for encrypted archives (remembered per archive for the session).
+- GUI: Shift-click selects a range and Ctrl-click toggles an item.
+- Multi-threaded TAR.GZ and TAR.BZ2 compression (block-parallel gzip / bzip2 streams), and decoding of compressed TAR on a read-ahead thread.
+- Memory-mapped reads for very large input files.
 - Ignored allocation profiling harness (`tests/alloc_profile.rs`) that reports allocation counts and peak live bytes for archive creation and extraction.
 
 ### Changed
@@ -23,8 +32,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 7z extraction now decodes independent blocks concurrently on multi-block archives, buffering entries through a 64 MB budget and serializing disk writes on a single writer thread; single-block and flat extraction keep the ordered pipeline.
 - Memory: file copies reuse one 256 KB thread-local buffer instead of allocating per entry; 7z prepared blocks and the 7z extraction queue have explicit 256 MB / 64 MB budgets.
 - Migrated the 7z backend from `sevenz-rust` 0.6 to `sevenz-rust2` 0.25.
+- Archives are opened by their content first and their extension second, so a misnamed archive still opens; detection checks full signatures and validates TAR headers.
+- `l` and `t` honour the file names they are given.
+- `-ao` modes other than `a`, `s` and `u` are rejected instead of ignored.
+
+### Security
+- Extraction refuses archives with entry names that would escape the output directory (`..`, absolute paths, drive and stream prefixes on Windows), before writing anything.
+- `a … -p` for `.zip` encrypts entries with AES-256; before, the password was ignored and the zip was written unencrypted. AES-encrypted zips can now be read.
+- The GUI opens files through the Windows shell API instead of `cmd /c start`, so a file name containing `&` can no longer run commands.
 
 ### Fixed
+- Extracting an encrypted 7z where a file cannot be written (full disk, permissions) reports the write error instead of asking for the password again.
+- Existing files are no longer replaced silently on extraction, and `-y` now has an effect.
+- File-name filters on extraction match exact paths (and folder contents) instead of any name containing the text.
+- TAR hard links are extracted as copies, and symbolic links and special entries are skipped with a warning instead of being written as empty files.
+- Multi-member gzip and multi-stream bzip2 TAR files are read completely.
+- GUI: the Test button actually tests the archive; 7z folders are listed once; arrow keys in an empty folder no longer panic; copying folders from disk works and disk errors are reported.
 - `-mmt` now changes 7z compression wall-clock time instead of only changing solid-block boundaries.
 - ZIP parallel compression can no longer accumulate an unbounded reorder buffer; in-flight batch data is capped at 256 MB.
 - `-mx=0` now stores 7z entries with the COPY method, matching 7-Zip.
