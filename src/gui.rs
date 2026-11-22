@@ -126,29 +126,141 @@ pub struct OpenArchiveGui {
 
 // ─── Platform helpers ─────────────────────────────────────────────────────────
 
-fn open_file_externally(path: &Path) {
+/// Opens `path` with its default program.
+///
+/// Never goes through `cmd.exe`: file names come from archives and may
+/// contain `&`, `|` or `^`, which `cmd /c start` would run as commands.
+fn open_file_externally(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let path_str = path.to_string_lossy().to_string();
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", &path_str])
-            .spawn();
+        shell_open::open(path)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(path)
-            .spawn();
+        std::process::Command::new("xdg-open").arg(path).spawn().map(drop)
     }
 }
 
-fn open_with_dialog(path: &Path) {
+/// Shows the system "Open with" dialog for `path`.
+fn open_with_dialog(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let path_str = path.to_string_lossy().to_string();
-        let _ = std::process::Command::new("rundll32.exe")
-            .args(["shell32.dll,OpenAs_RunDLL", &path_str])
-            .spawn();
+        // rundll32 is started directly (no shell), so the name is not parsed
+        // for commands.
+        std::process::Command::new("rundll32.exe")
+            .arg("shell32.dll,OpenAs_RunDLL")
+            .arg(path)
+            .spawn()
+            .map(drop)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        open_file_externally(path)
+    }
+}
+
+/// `ShellExecuteExW`, the API behind `start`, called directly so the path
+/// is passed as data rather than parsed as a command line.
+#[cfg(target_os = "windows")]
+mod shell_open {
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
+    /// Report failures as errors instead of showing a message box.
+    const SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
+    const SW_SHOWNORMAL: i32 = 1;
+
+    /// `SHELLEXECUTEINFOW` from shellapi.h.
+    #[repr(C)]
+    struct ShellExecuteInfoW {
+        cb_size: u32,
+        f_mask: u32,
+        hwnd: *mut c_void,
+        lp_verb: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show: i32,
+        h_inst_app: *mut c_void,
+        lp_id_list: *mut c_void,
+        lp_class: *const u16,
+        hkey_class: *mut c_void,
+        dw_hot_key: u32,
+        h_icon_or_monitor: *mut c_void,
+        h_process: *mut c_void,
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
+    }
+
+    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    pub(super) fn open(path: &Path) -> io::Result<()> {
+        let verb = wide("open".as_ref());
+        let file = wide(path.as_os_str());
+        let mut info = ShellExecuteInfoW {
+            cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+            f_mask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+            hwnd: std::ptr::null_mut(),
+            lp_verb: verb.as_ptr(),
+            lp_file: file.as_ptr(),
+            lp_parameters: std::ptr::null(),
+            lp_directory: std::ptr::null(),
+            n_show: SW_SHOWNORMAL,
+            h_inst_app: std::ptr::null_mut(),
+            lp_id_list: std::ptr::null_mut(),
+            lp_class: std::ptr::null(),
+            hkey_class: std::ptr::null_mut(),
+            dw_hot_key: 0,
+            h_icon_or_monitor: std::ptr::null_mut(),
+            h_process: std::ptr::null_mut(),
+        };
+        // SAFETY: `info` is a fully initialised SHELLEXECUTEINFOW whose string
+        // pointers reference NUL-terminated buffers that outlive the call.
+        if unsafe { ShellExecuteExW(&mut info) } != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn scratch(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("openarchive-shell-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn struct_matches_the_windows_layout() {
+            // sizeof(SHELLEXECUTEINFOW) on x64 / x86.
+            let expected = if cfg!(target_pointer_width = "64") { 112 } else { 60 };
+            assert_eq!(std::mem::size_of::<ShellExecuteInfoW>(), expected);
+        }
+
+        #[test]
+        fn shell_metacharacters_in_names_are_not_executed() {
+            // Under `cmd /c start`, everything after `&` ran as a command
+            // (OA-25). The file does not exist, so nothing is opened either.
+            let dir = scratch("inject");
+            let marker = dir.join("PWNED_OA");
+            let name = format!("x&md,\"{}\"", marker.display());
+            let err = open(&dir.join(name)).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(2), "{err}"); // ERROR_FILE_NOT_FOUND
+            assert!(!marker.exists(), "shell metacharacters were executed");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 
@@ -516,7 +628,11 @@ impl OpenArchiveGui {
                 if !target_file.exists() {
                     anyhow::bail!("{full_internal} was not found in the archive");
                 }
-                if *open_with { open_with_dialog(&target_file); } else { open_file_externally(&target_file); }
+                if *open_with {
+                    open_with_dialog(&target_file)?;
+                } else {
+                    open_file_externally(&target_file)?;
+                }
                 self.show_notification(format!("Opened {file_name}"));
             }
             ArchiveOp::ExtractItem { full_internal, name, is_dir, dest } => {
@@ -642,8 +758,10 @@ impl OpenArchiveGui {
                         internal_prefix: String::new(),
                     });
                 } else {
-                    open_file_externally(&target);
-                    self.show_notification(format!("Opening {}", item.name));
+                    match open_file_externally(&target) {
+                        Ok(()) => self.show_notification(format!("Opening {}", item.name)),
+                        Err(err) => self.show_notification(format!("Failed to open {}: {err}", item.name)),
+                    }
                 }
             }
             NavLocation::Archive { archive_path, internal_prefix } => {
@@ -685,7 +803,11 @@ impl OpenArchiveGui {
             ContextAction::Open(item) => { self.open_item(item); }
             ContextAction::OpenWith(item) => {
                 match &self.current_location {
-                    NavLocation::Disk(dir) => { open_with_dialog(&dir.join(&item.name)); }
+                    NavLocation::Disk(dir) => {
+                        if let Err(err) = open_with_dialog(&dir.join(&item.name)) {
+                            self.show_notification(format!("Failed to open {}: {err}", item.name));
+                        }
+                    }
                     NavLocation::Archive { archive_path, internal_prefix } => {
                         let (arc, prefix) = (archive_path.clone(), internal_prefix.clone());
                         self.preview_archive_item(arc, &prefix, &item, true);
