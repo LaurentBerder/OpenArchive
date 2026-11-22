@@ -352,7 +352,7 @@ fn test_tar_roundtrip_formats() {
 
     let exe = env!("CARGO_BIN_EXE_openarchive");
 
-    for ext in ["tar", "tar.gz", "tar.bz2"] {
+    for ext in ["tar", "tar.gz", "tar.bz2", "tar.xz"] {
         let archive = format!("archive_roundtrip.{}", ext);
         let created = Command::new(exe)
             .args(["a", &archive, test_dir, "-mx=5"])
@@ -1455,6 +1455,49 @@ fn test_tar_skipped_links_are_reported_on_stderr() {
     assert!(stderr.contains("Warning: skipped symbolic link s.txt -> a.txt"), "{stderr}");
     assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"hello");
     assert!(fs::symlink_metadata(out.join("s.txt")).is_err());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_tar_xz_roundtrip_single_and_multithreaded() {
+    let dir = PathBuf::from("test_tar_xz");
+    let _ = fs::remove_dir_all(&dir);
+    let src = dir.join("src");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    // 8 MB of mildly compressible data: several 3 MiB blocks at -mx=1.
+    let big: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| ((i / 7) % 251) as u8).collect();
+    fs::write(src.join("big.bin"), &big).unwrap();
+    fs::write(src.join("sub/small.txt"), b"small").unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    for (name, level, threads) in [
+        ("st.tar.xz", "-mx=1", "-mmt=1"),
+        ("mt.tar.xz", "-mx=1", "-mmt=4"),
+        ("store.txz", "-mx=0", "-mmt=1"),
+    ] {
+        let archive = dir.join(name);
+        let created = Command::new(exe)
+            .current_dir(&dir)
+            .args(["a", name, "src", level, threads])
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{name}: {}", String::from_utf8_lossy(&created.stderr));
+        // xz stream magic.
+        assert_eq!(&fs::read(&archive).unwrap()[..6], &[0xFD, b'7', b'z', b'X', b'Z', 0x00], "{name}");
+
+        let tested = Command::new(exe).args(["t", archive.to_str().unwrap()]).output().unwrap();
+        assert!(tested.status.success(), "{name}: test");
+
+        let out = dir.join(format!("out-{name}"));
+        let extracted = Command::new(exe)
+            .args(["x", archive.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(extracted.status.success(), "{name}: extract");
+        assert_eq!(fs::read(out.join("src/big.bin")).unwrap(), big, "{name}");
+        assert_eq!(fs::read(out.join("src/sub/small.txt")).unwrap(), b"small", "{name}");
+    }
 
     let _ = fs::remove_dir_all(&dir);
 }

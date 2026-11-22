@@ -4,10 +4,12 @@ use bzip2::read::MultiBzDecoder;
 use bzip2::write::BzEncoder;
 use flate2::Compression as GzCompression;
 use flate2::read::MultiGzDecoder;
+use lzma_rust2::{DICT_SIZE_MAX, DICT_SIZE_MIN, XzOptions, XzReader, XzWriter, XzWriterMt};
 use flate2::write::GzEncoder;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, empty};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,6 +54,8 @@ impl TarHandler {
             ArchiveFormat::Tar => Ok(Box::new(buf_file)),
             ArchiveFormat::TarGz => Ok(Box::new(MultiGzDecoder::new(buf_file))),
             ArchiveFormat::TarBz2 => Ok(Box::new(MultiBzDecoder::new(buf_file))),
+            // `true`: like gzip/bzip2 above, read concatenated streams.
+            ArchiveFormat::TarXz => Ok(Box::new(XzReader::new(buf_file, true))),
             _ => anyhow::bail!("Unsupported tar format variant"),
         }
     }
@@ -447,6 +451,17 @@ impl ArchiveWriter for TarHandler {
 
 type ArchiveFile = BufWriter<File>;
 
+/// Encoder memory allowed across xz workers, as for the 7z writer.
+const XZ_MEMORY_BUDGET_KIB: u64 = 1536 * 1024;
+
+/// Workers that fit the memory budget: each holds an encoder plus an input
+/// and an output block.
+fn xz_worker_count(requested: usize, options: &XzOptions, block_size: u64) -> usize {
+    let per_worker_kib = options.lzma_options.get_memory_usage() as u64 + 2 * block_size / 1024;
+    let by_memory = (XZ_MEMORY_BUDGET_KIB / per_worker_kib.max(1)).max(1) as usize;
+    requested.min(by_memory).clamp(1, 256)
+}
+
 /// The byte sink behind `tar::Builder`: the archive file itself, a
 /// single-stream encoder, or the block-parallel compressor.
 enum TarOutput {
@@ -454,12 +469,16 @@ enum TarOutput {
     Gzip(GzEncoder<ArchiveFile>),
     Bzip2(BzEncoder<ArchiveFile>),
     Parallel(ParallelCompressor<ArchiveFile>),
+    Xz(XzWriter<ArchiveFile>),
+    /// xz has its own block-parallel encoder; it writes one standard stream.
+    XzMt(XzWriterMt<ArchiveFile>),
 }
 
 impl TarOutput {
     fn new(file: ArchiveFile, format: ArchiveFormat, options: &CompressionOptions) -> Result<Self> {
         let codec = match format {
             ArchiveFormat::Tar => return Ok(Self::Plain(file)),
+            ArchiveFormat::TarXz => return Self::xz(file, options),
             ArchiveFormat::TarGz => Codec::Gzip(options.level.clamp(0, 9) as u32),
             ArchiveFormat::TarBz2 => Codec::Bzip2(options.level.clamp(1, 9) as u32),
             _ => anyhow::bail!("Invalid tar archive target"),
@@ -482,6 +501,30 @@ impl TarOutput {
         })
     }
 
+    /// The xz encoder: block-parallel when more than one worker fits in the
+    /// encoder memory budget, single-threaded otherwise.
+    fn xz(file: ArchiveFile, options: &CompressionOptions) -> Result<Self> {
+        let mut xz_options = XzOptions::with_preset(options.level.min(9) as u32);
+        if let Some(dict_size) = options.dict_size {
+            xz_options.lzma_options.dict_size = dict_size.clamp(DICT_SIZE_MIN, DICT_SIZE_MAX);
+        }
+
+        let requested = options
+            .threads
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+            .max(1);
+        // Blocks of 3 × the dictionary, as xz itself uses (at least 1 MiB).
+        let block_size = (3 * xz_options.lzma_options.dict_size as u64).max(1024 * 1024);
+        let workers = xz_worker_count(requested, &xz_options, block_size);
+
+        if workers > 1 {
+            xz_options.set_block_size(NonZeroU64::new(block_size));
+            Ok(Self::XzMt(XzWriterMt::new(file, xz_options, workers as u32)?))
+        } else {
+            Ok(Self::Xz(XzWriter::new(file, xz_options)?))
+        }
+    }
+
     /// Write the compressed stream's trailer and flush the archive file.
     /// Dropping an encoder instead would swallow errors from the final write.
     fn finish(self) -> std::io::Result<()> {
@@ -490,6 +533,8 @@ impl TarOutput {
             Self::Gzip(enc) => enc.finish()?,
             Self::Bzip2(enc) => enc.finish()?,
             Self::Parallel(enc) => enc.finish()?,
+            Self::Xz(enc) => enc.finish()?,
+            Self::XzMt(enc) => enc.finish()?,
         };
         file.flush()
     }
@@ -502,6 +547,8 @@ impl Write for TarOutput {
             Self::Gzip(w) => w.write(buf),
             Self::Bzip2(w) => w.write(buf),
             Self::Parallel(w) => w.write(buf),
+            Self::Xz(w) => w.write(buf),
+            Self::XzMt(w) => w.write(buf),
         }
     }
 
@@ -511,6 +558,8 @@ impl Write for TarOutput {
             Self::Gzip(w) => w.write_all(buf),
             Self::Bzip2(w) => w.write_all(buf),
             Self::Parallel(w) => w.write_all(buf),
+            Self::Xz(w) => w.write_all(buf),
+            Self::XzMt(w) => w.write_all(buf),
         }
     }
 
@@ -520,6 +569,8 @@ impl Write for TarOutput {
             Self::Gzip(w) => w.flush(),
             Self::Bzip2(w) => w.flush(),
             Self::Parallel(w) => w.flush(),
+            Self::Xz(w) => w.flush(),
+            Self::XzMt(w) => w.flush(),
         }
     }
 }

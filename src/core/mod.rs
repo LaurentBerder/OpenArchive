@@ -15,6 +15,7 @@ pub enum ArchiveFormat {
     Tar,
     TarGz,
     TarBz2,
+    TarXz,
 }
 
 impl ArchiveFormat {
@@ -27,6 +28,9 @@ impl ArchiveFormat {
         }
         if file_name.ends_with(".tar.bz2") || file_name.ends_with(".tbz2") {
             return Some(Self::TarBz2);
+        }
+        if file_name.ends_with(".tar.xz") || file_name.ends_with(".txz") {
+            return Some(Self::TarXz);
         }
         if file_name.ends_with(".7z") {
             return Some(Self::SevenZip);
@@ -72,6 +76,7 @@ impl ArchiveFormat {
             Self::Tar => "tar",
             Self::TarGz => "tar.gz",
             Self::TarBz2 => "tar.bz2",
+            Self::TarXz => "tar.xz",
         }
     }
 }

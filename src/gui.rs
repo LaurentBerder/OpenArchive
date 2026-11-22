@@ -1319,7 +1319,7 @@ impl eframe::App for OpenArchiveGui {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open Archive...").clicked() {
                         if let Some(file) = rfd::FileDialog::new()
-                            .add_filter("Archives", &["7z", "zip", "tar", "gz", "bz2"])
+                            .add_filter("Archives", &["7z", "zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz"])
                             .pick_file()
                         {
                             self.open_archive_from_path(file);
@@ -1378,7 +1378,7 @@ impl eframe::App for OpenArchiveGui {
 
                 if ui.button(RichText::new("📂 Open Archive").size(14.0)).clicked() {
                     if let Some(file) = rfd::FileDialog::new()
-                        .add_filter("Supported Archives (*.7z, *.zip, *.tar.gz)", &["7z", "zip", "tar", "gz", "bz2"])
+                        .add_filter("Supported Archives (*.7z, *.zip, *.tar, *.tar.gz, *.tar.bz2, *.tar.xz)", &["7z", "zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz"])
                         .pick_file()
                     {
                         self.open_archive_from_path(file);

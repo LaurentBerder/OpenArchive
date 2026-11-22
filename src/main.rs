@@ -35,7 +35,7 @@ fn print_help() {
     println!("  -r           : Recurse subdirectories");
     println!("  -y           : Assume Yes on all queries");
     println!();
-    println!("Supported Formats: .7z, .zip, .tar, .tar.gz, .tar.bz2");
+    println!("Supported Formats: .7z, .zip, .tar, .tar.gz, .tar.bz2, .tar.xz");
 }
 
 fn main() -> Result<()> {

@@ -8,7 +8,7 @@ description = "A modern, high-performance, modular Rust-backed equivalent of 7-Z
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 sevenz-rust2 = { version = "0.25", default-features = false, features = ["aes256", "compress"] }
-lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "xz"] }
 zip = { version = "2.2", default-features = false, features = ["aes-crypto", "deflate", "bzip2", "time"] }
 tar = "0.4"
 flate2 = "1.0"

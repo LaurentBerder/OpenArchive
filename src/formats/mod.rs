@@ -19,7 +19,7 @@ pub fn get_reader<P: AsRef<Path>>(path: P, password: Option<String>) -> Result<B
     match format {
         ArchiveFormat::SevenZip => Ok(Box::new(SevenZHandler::new(p, password))),
         ArchiveFormat::Zip => Ok(Box::new(ZipHandler::new(p, password))),
-        ArchiveFormat::Tar | ArchiveFormat::TarGz | ArchiveFormat::TarBz2 => {
+        ArchiveFormat::Tar | ArchiveFormat::TarGz | ArchiveFormat::TarBz2 | ArchiveFormat::TarXz => {
             Ok(Box::new(TarHandler::new(p, format)))
         }
     }
@@ -32,7 +32,7 @@ pub fn create_archive(archive_path: &Path, files: &[PathBuf], options: &Compress
     match format {
         ArchiveFormat::SevenZip => SevenZHandler::create(archive_path, files, options),
         ArchiveFormat::Zip => ZipHandler::create(archive_path, files, options),
-        ArchiveFormat::Tar | ArchiveFormat::TarGz | ArchiveFormat::TarBz2 => {
+        ArchiveFormat::Tar | ArchiveFormat::TarGz | ArchiveFormat::TarBz2 | ArchiveFormat::TarXz => {
             TarHandler::create(archive_path, files, options)
         }
     }
