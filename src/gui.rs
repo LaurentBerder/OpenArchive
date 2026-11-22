@@ -484,6 +484,11 @@ fn filter_archive_entries(all: &[ArchiveEntry], prefix: &str) -> Vec<DisplayItem
                     });
                 }
             } else {
+                // 7z stores folders as entries without a trailing slash; the
+                // folder may already be listed because of a file inside it.
+                if entry.is_dir && !seen_dirs.insert(rel.to_string()) {
+                    continue;
+                }
                 items.push(DisplayItem {
                     name: rel.to_string(),
                     is_dir: entry.is_dir,
@@ -971,4 +976,38 @@ pub fn run_gui(initial_archive: Option<PathBuf>) -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool) -> ArchiveEntry {
+        ArchiveEntry {
+            name: name.into(),
+            size: 0,
+            compressed_size: None,
+            is_dir,
+            modified: None,
+            crc32: None,
+            encrypted: false,
+        }
+    }
+
+    fn names(entries: &[ArchiveEntry], prefix: &str) -> Vec<String> {
+        filter_archive_entries(entries, prefix).into_iter().map(|item| item.name).collect()
+    }
+
+    #[test]
+    fn folder_entries_are_listed_once() {
+        // 7z style: folder entry without trailing slash, before or after its files.
+        let before = [entry("src", true), entry("src/a.txt", false)];
+        let after = [entry("src/a.txt", false), entry("src", true)];
+        // zip style: folder entry with trailing slash.
+        let zip = [entry("src/", true), entry("src/a.txt", false)];
+        for entries in [&before[..], &after[..], &zip[..]] {
+            assert_eq!(names(entries, ""), ["src"]);
+            assert_eq!(names(entries, "src/"), ["a.txt"]);
+        }
+    }
 }
