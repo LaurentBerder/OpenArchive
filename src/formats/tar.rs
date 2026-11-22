@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tar::Header;
 use walkdir::WalkDir;
 
+use super::stream_compress::{self, Codec, ParallelCompressor};
 use crate::core::io as file_io;
 use crate::core::{
     ArchiveEntry, ArchiveFormat, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions,
@@ -311,19 +312,7 @@ impl ArchiveWriter for TarHandler {
         let buf_file = BufWriter::with_capacity(file_io::ARCHIVE_BUFFER_SIZE, file);
 
         let format = ArchiveFormat::from_path(archive_path).unwrap_or(ArchiveFormat::Tar);
-
-        let writer: Box<dyn Write> = match format {
-            ArchiveFormat::Tar => Box::new(buf_file),
-            ArchiveFormat::TarGz => {
-                let level = GzCompression::new(options.level.clamp(0, 9) as u32);
-                Box::new(GzEncoder::new(buf_file, level))
-            }
-            ArchiveFormat::TarBz2 => {
-                let level = BzCompression::new(options.level.clamp(1, 9) as u32);
-                Box::new(BzEncoder::new(buf_file, level))
-            }
-            _ => anyhow::bail!("Invalid tar archive target"),
-        };
+        let writer = TarOutput::new(buf_file, format, options)?;
 
         let mut builder = tar::Builder::new(writer);
 
@@ -365,9 +354,87 @@ impl ArchiveWriter for TarHandler {
             }
         }
 
-        let mut output = builder.into_inner()?;
-        output.flush()?;
+        builder.into_inner()?.finish()?;
         Ok(())
+    }
+}
+
+type ArchiveFile = BufWriter<File>;
+
+/// The byte sink behind `tar::Builder`: the archive file itself, a
+/// single-stream encoder, or the block-parallel compressor.
+enum TarOutput {
+    Plain(ArchiveFile),
+    Gzip(GzEncoder<ArchiveFile>),
+    Bzip2(BzEncoder<ArchiveFile>),
+    Parallel(ParallelCompressor<ArchiveFile>),
+}
+
+impl TarOutput {
+    fn new(file: ArchiveFile, format: ArchiveFormat, options: &CompressionOptions) -> Result<Self> {
+        let codec = match format {
+            ArchiveFormat::Tar => return Ok(Self::Plain(file)),
+            ArchiveFormat::TarGz => Codec::Gzip(options.level.clamp(0, 9) as u32),
+            ArchiveFormat::TarBz2 => Codec::Bzip2(options.level.clamp(1, 9) as u32),
+            _ => anyhow::bail!("Invalid tar archive target"),
+        };
+
+        let requested = options.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
+        let workers = stream_compress::worker_count(codec, requested);
+        if workers > 1 {
+            return Ok(Self::Parallel(ParallelCompressor::new(file, codec, workers)?));
+        }
+
+        // One thread: a single gzip member / bzip2 stream, exactly as before.
+        Ok(match codec {
+            Codec::Gzip(level) => Self::Gzip(GzEncoder::new(file, GzCompression::new(level))),
+            Codec::Bzip2(level) => Self::Bzip2(BzEncoder::new(file, BzCompression::new(level))),
+        })
+    }
+
+    /// Write the compressed stream's trailer and flush the archive file.
+    /// Dropping an encoder instead would swallow errors from the final write.
+    fn finish(self) -> std::io::Result<()> {
+        let mut file = match self {
+            Self::Plain(file) => file,
+            Self::Gzip(enc) => enc.finish()?,
+            Self::Bzip2(enc) => enc.finish()?,
+            Self::Parallel(enc) => enc.finish()?,
+        };
+        file.flush()
+    }
+}
+
+impl Write for TarOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(w) => w.write(buf),
+            Self::Gzip(w) => w.write(buf),
+            Self::Bzip2(w) => w.write(buf),
+            Self::Parallel(w) => w.write(buf),
+        }
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(w) => w.write_all(buf),
+            Self::Gzip(w) => w.write_all(buf),
+            Self::Bzip2(w) => w.write_all(buf),
+            Self::Parallel(w) => w.write_all(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(w) => w.flush(),
+            Self::Gzip(w) => w.flush(),
+            Self::Bzip2(w) => w.flush(),
+            Self::Parallel(w) => w.flush(),
+        }
     }
 }
 

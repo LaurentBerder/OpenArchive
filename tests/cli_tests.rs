@@ -462,6 +462,135 @@ fn test_tar_reads_multi_member_streams() {
     }
 }
 
+/// Decode a compressed TAR with the standard decoder crates (no OpenArchive
+/// code involved) and return (path, contents) for each regular file.
+fn decode_tar_with_std_crates(path: &str) -> Vec<(String, Vec<u8>)> {
+    use std::io::Read;
+
+    let file = fs::File::open(path).unwrap();
+    let reader: Box<dyn Read> = if path.ends_with(".gz") {
+        Box::new(flate2::read::MultiGzDecoder::new(file))
+    } else {
+        Box::new(bzip2::read::MultiBzDecoder::new(file))
+    };
+    let mut archive = tar::Archive::new(reader);
+    let mut out = Vec::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.header().entry_type().is_file() {
+            let name = entry.path().unwrap().to_string_lossy().replace('\\', "/");
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            out.push((name, data));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Count gzip members by decoding them one at a time.
+fn gzip_member_count(data: &[u8]) -> usize {
+    use std::io::Read;
+
+    let mut rest = data;
+    let mut count = 0;
+    while !rest.is_empty() {
+        let mut decoder = flate2::bufread::GzDecoder::new(rest);
+        std::io::copy(&mut decoder, &mut std::io::sink()).unwrap();
+        let mut remaining = Vec::new();
+        decoder.into_inner().read_to_end(&mut remaining).unwrap();
+        let consumed = rest.len() - remaining.len();
+        assert!(consumed > 0);
+        rest = &rest[consumed..];
+        count += 1;
+    }
+    count
+}
+
+#[test]
+fn test_tar_parallel_compression_roundtrip() {
+    let test_dir = "test_data_tar_parallel";
+    fs::create_dir_all(format!("{}/nested", test_dir)).unwrap();
+
+    // ~6 MB of mixed content: compressible text plus pseudo-random noise,
+    // enough for several gzip chunks and bzip2 streams.
+    let mut text = String::new();
+    for i in 0..60_000 {
+        text.push_str(&format!("line {i}: parallel tar payload {}\n", (i * 7919) % 10_007));
+    }
+    let mut noise = Vec::with_capacity(3 * 1024 * 1024);
+    let mut x: u32 = 0x1234_5678;
+    for _ in 0..noise.capacity() {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        noise.push(x as u8);
+    }
+    fs::write(format!("{}/text.txt", test_dir), &text).unwrap();
+    fs::write(format!("{}/nested/noise.bin", test_dir), &noise).unwrap();
+    fs::write(format!("{}/nested/empty.txt", test_dir), b"").unwrap();
+    for i in 0..50 {
+        fs::write(format!("{}/nested/small_{i}.txt", test_dir), format!("small {i}")).unwrap();
+    }
+
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    for ext in ["tar.gz", "tar.bz2"] {
+        let mut decoded_by_threads = Vec::new();
+        for threads in ["1", "4"] {
+            let archive = format!("archive_parallel_mmt{}.{}", threads, ext);
+            let created = Command::new(exe)
+                .args(["a", &archive, test_dir, "-mx=6", &format!("-mmt={}", threads)])
+                .status()
+                .unwrap();
+            assert!(created.success(), "failed to create {}", archive);
+
+            let bytes = fs::read(&archive).unwrap();
+            if ext == "tar.gz" {
+                let members = gzip_member_count(&bytes);
+                if threads == "1" {
+                    assert_eq!(members, 1, "-mmt=1 must keep a single gzip member");
+                } else {
+                    assert!(members > 1, "-mmt=4 should produce several members");
+                }
+            } else {
+                assert_eq!(&bytes[..4], b"BZh6");
+            }
+
+            // Standard decoder crates read every member.
+            let decoded = decode_tar_with_std_crates(&archive);
+            let lookup = |name: &str| {
+                decoded
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, d)| d.clone())
+                    .unwrap_or_else(|| panic!("{} missing from {}", name, archive))
+            };
+            assert_eq!(lookup(&format!("{}/text.txt", test_dir)), text.as_bytes());
+            assert_eq!(lookup(&format!("{}/nested/noise.bin", test_dir)), noise);
+            assert!(lookup(&format!("{}/nested/empty.txt", test_dir)).is_empty());
+            assert_eq!(decoded.len(), 53);
+            decoded_by_threads.push(decoded);
+
+            // And OpenArchive's own extraction.
+            let out_dir = format!("out_tar_parallel_mmt{}_{}", threads, ext.replace('.', "_"));
+            let extracted = Command::new(exe)
+                .args(["x", &archive, "-o", &out_dir])
+                .status()
+                .unwrap();
+            assert!(extracted.success(), "failed to extract {}", archive);
+            let base = PathBuf::from(&out_dir).join(test_dir);
+            assert_eq!(fs::read(base.join("nested/noise.bin")).unwrap(), noise);
+            assert_eq!(fs::read_to_string(base.join("text.txt")).unwrap(), text);
+
+            let _ = fs::remove_dir_all(&out_dir);
+            let _ = fs::remove_file(&archive);
+        }
+        assert_eq!(decoded_by_threads[0], decoded_by_threads[1]);
+    }
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
 #[test]
 fn test_tar_large_entries_use_sequential_path() {
     let test_dir = "test_data_tar_large_entries";

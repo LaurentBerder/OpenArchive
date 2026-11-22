@@ -95,8 +95,9 @@ fn pipeline_bytes(codec: Codec, workers: u64) -> u64 {
 /// Number of compression workers for `requested` threads, capped so the
 /// whole pipeline fits in the in-flight memory budget.
 pub(crate) fn worker_count(codec: Codec, requested: usize) -> usize {
-    let fixed = codec.bytes_per_chunk();
-    let per_worker = 2 * codec.bytes_per_chunk() + codec.encoder_bytes();
+    // pipeline_bytes is linear in w: fixed + w * per_worker.
+    let fixed = pipeline_bytes(codec, 0);
+    let per_worker = pipeline_bytes(codec, 1) - fixed;
     let cap = (MAX_INFLIGHT_BYTES.saturating_sub(fixed) / per_worker).max(1) as usize;
     requested.max(1).min(cap)
 }
@@ -296,7 +297,7 @@ mod tests {
         while out.len() < len {
             x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
             // Mix compressible text with noise.
-            if (x >> 16) % 4 == 0 {
+            if (x >> 16).is_multiple_of(4) {
                 out.push((x >> 24) as u8);
             } else {
                 out.extend_from_slice(b"openarchive ");
