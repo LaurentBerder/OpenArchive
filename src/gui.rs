@@ -68,6 +68,25 @@ struct PasswordPrompt {
     incorrect: bool,
 }
 
+// ─── Pointer input ────────────────────────────────────────────────────────────
+
+/// How far, in points, the pointer must move after a press before it is a
+/// rubber-band drag rather than a click.
+const RUBBER_BAND_THRESHOLD: f32 = 4.0;
+
+/// One frame of pointer input, as rubber-band selection needs it.
+#[derive(Clone, Copy, Debug, Default)]
+struct PointerFrame {
+    /// Where the primary button went down this frame, if it did.
+    pressed_at: Option<egui::Pos2>,
+    /// The primary button is held.
+    primary_down: bool,
+    /// Current pointer position.
+    hover: Option<egui::Pos2>,
+    /// Ctrl is held: add to the selection instead of replacing it.
+    additive: bool,
+}
+
 // ─── App State ────────────────────────────────────────────────────────────────
 
 pub struct OpenArchiveGui {
@@ -81,10 +100,13 @@ pub struct OpenArchiveGui {
     selected_indices: HashSet<usize>,
     /// The "anchor" index used as the fixed end of a Shift-range.
     anchor_index: Option<usize>,
+    /// The row the keyboard is on: the moving end of a Shift-range. Arrow
+    /// keys move from here, Enter opens it.
+    focus_index: Option<usize>,
 
-    /// True while the user is drag-selecting; tracks the initial pointer position.
+    /// Where the primary button went down inside the list, while it is held.
     drag_select_start: Option<egui::Pos2>,
-    /// Current pointer position during a drag (updated each frame).
+    /// Current pointer position while the button is held.
     drag_select_current: Option<egui::Pos2>,
 
     status_message: String,
@@ -147,6 +169,7 @@ impl OpenArchiveGui {
             items: Vec::new(),
             selected_indices: HashSet::new(),
             anchor_index: None,
+            focus_index: None,
             drag_select_start: None,
             drag_select_current: None,
             status_message: "Ready".to_string(),
@@ -241,6 +264,7 @@ impl OpenArchiveGui {
     fn clear_selection(&mut self) {
         self.selected_indices.clear();
         self.anchor_index = None;
+        self.focus_index = None;
         self.drag_select_start = None;
         self.drag_select_current = None;
     }
@@ -248,18 +272,22 @@ impl OpenArchiveGui {
     fn select_all(&mut self) {
         self.selected_indices = (0..self.items.len()).collect();
         self.anchor_index = Some(0);
+        self.focus_index = Some(0);
         self.update_status();
     }
 
-    /// Single-click: set exactly this row as selected (clears others). Updates anchor.
+    /// Single-click: set exactly this row as selected (clears others). Moves
+    /// anchor and focus to it.
     fn select_single(&mut self, idx: usize) {
         self.selected_indices.clear();
         self.selected_indices.insert(idx);
         self.anchor_index = Some(idx);
+        self.focus_index = Some(idx);
         self.update_status();
     }
 
-    /// Ctrl+click: toggle membership of this row. Updates anchor to clicked row.
+    /// Ctrl+click: toggle membership of this row, keeping the rest. Moves
+    /// anchor and focus to it.
     fn select_toggle(&mut self, idx: usize) {
         if self.selected_indices.contains(&idx) {
             self.selected_indices.remove(&idx);
@@ -267,12 +295,16 @@ impl OpenArchiveGui {
             self.selected_indices.insert(idx);
         }
         self.anchor_index = Some(idx);
+        self.focus_index = Some(idx);
         self.update_status();
     }
 
-    /// Shift+click: range from anchor to idx (inclusive). Does not change anchor.
+    /// Shift+click: select the range from the anchor to `idx` (inclusive).
+    /// The anchor stays put; the focus moves to `idx`.
     fn select_range_to(&mut self, idx: usize) {
         let anchor = self.anchor_index.unwrap_or(idx);
+        self.anchor_index = Some(anchor);
+        self.focus_index = Some(idx);
         let lo = anchor.min(idx);
         let hi = anchor.max(idx);
         self.selected_indices.clear();
@@ -282,16 +314,19 @@ impl OpenArchiveGui {
         self.update_status();
     }
 
-    /// Arrow keys: move one row down or up from the anchor; with `extend`
-    /// (Shift), select the range instead of the single row. Does nothing in
-    /// an empty list.
+    /// Arrow keys: move the focus one row down or up; with `extend` (Shift),
+    /// select the range from the anchor instead of the single row. Does
+    /// nothing in an empty list.
     fn move_focus(&mut self, down: bool, extend: bool) {
         let total = self.items.len();
         if total == 0 {
             return;
         }
-        let current = self.anchor_index.unwrap_or(0).min(total - 1);
+        let current = self.focus_index.or(self.anchor_index).unwrap_or(0).min(total - 1);
         let target = if down { (current + 1).min(total - 1) } else { current.saturating_sub(1) };
+        if self.anchor_index.is_some_and(|anchor| anchor >= total) {
+            self.anchor_index = Some(current);
+        }
         if extend {
             self.select_range_to(target);
         } else {
@@ -299,15 +334,50 @@ impl OpenArchiveGui {
         }
     }
 
-    /// Rubber-band drag: select all rows whose rects intersect the drag rectangle.
-    fn apply_rubber_band(&mut self, drag_rect: Rect, row_rects: &[(usize, Rect)]) {
-        self.selected_indices.clear();
+    /// Rubber-band drag: select all rows whose rects intersect the drag
+    /// rectangle. With `additive` (Ctrl held), add them to the current
+    /// selection instead of replacing it.
+    fn apply_rubber_band(&mut self, drag_rect: Rect, row_rects: &[(usize, Rect)], additive: bool) {
+        if !additive {
+            self.selected_indices.clear();
+        }
         for (idx, row_rect) in row_rects {
             if drag_rect.intersects(*row_rect) {
                 self.selected_indices.insert(*idx);
             }
         }
         self.update_status();
+    }
+
+    /// Feeds one frame of pointer input to rubber-band selection.
+    ///
+    /// A press inside `list_area` arms the band; it only becomes a drag once
+    /// the pointer moves [`RUBBER_BAND_THRESHOLD`] away. A plain click never
+    /// becomes a band, so it cannot overwrite what the click (or Ctrl/Shift-
+    /// click) handler selected in the same frame.
+    fn update_rubber_band(&mut self, frame: PointerFrame, list_area: Rect, row_rects: &[(usize, Rect)]) {
+        if let Some(pos) = frame.pressed_at {
+            self.drag_select_start = list_area.contains(pos).then_some(pos);
+            self.drag_select_current = None;
+        }
+        if frame.primary_down {
+            if self.drag_select_start.is_some() {
+                self.drag_select_current = frame.hover;
+            }
+            return;
+        }
+        if let Some(band) = self.rubber_band_rect() {
+            self.apply_rubber_band(band, row_rects, frame.additive);
+        }
+        self.drag_select_start = None;
+        self.drag_select_current = None;
+    }
+
+    /// The rubber band, once the pointer has moved far enough from the press
+    /// to be a drag rather than a click.
+    fn rubber_band_rect(&self) -> Option<Rect> {
+        let (start, end) = (self.drag_select_start?, self.drag_select_current?);
+        (start.distance(end) >= RUBBER_BAND_THRESHOLD).then(|| Rect::from_two_pos(start, end))
     }
 
     fn update_status(&mut self) {
@@ -763,13 +833,11 @@ impl eframe::App for OpenArchiveGui {
                 self.move_focus(false, i.modifiers.shift);
             }
 
-            // Enter opens the focused (anchor) item
-            if i.key_pressed(Key::Enter) {
-                if let Some(idx) = self.anchor_index {
-                    if let Some(item) = self.items.get(idx) {
-                        to_open = Some(item.clone());
-                    }
-                }
+            // Enter opens the focused item
+            if i.key_pressed(Key::Enter)
+                && let Some(item) = self.focus_index.or(self.anchor_index).and_then(|idx| self.items.get(idx))
+            {
+                to_open = Some(item.clone());
             }
 
             // Escape clears selection
@@ -1042,48 +1110,32 @@ impl eframe::App for OpenArchiveGui {
                 }
 
                 // ── Rubber-band drag selection ─────────────────────────────────
-                // Detect drag starting on empty space (not on a row)
-                let panel_resp = ui.allocate_response(
-                    Vec2::new(available_w, 0.0), // zero-height, just for input
-                    Sense::drag(),
-                );
-
-                ctx.input(|i| {
-                    // Start drag only when primary button goes down and no item was clicked
-                    if i.pointer.primary_pressed() && click_info.is_none() {
-                        if let Some(pos) = i.pointer.press_origin() {
-                            self.drag_select_start = Some(pos);
-                        }
-                    }
-                    if i.pointer.primary_down() {
-                        if self.drag_select_start.is_some() {
-                            self.drag_select_current = i.pointer.hover_pos();
-                        }
-                    }
-                    if !i.pointer.primary_down() {
-                        // Drag released: apply and clear
-                        if let (Some(start), Some(end)) = (self.drag_select_start, self.drag_select_current) {
-                            let drag_rect = Rect::from_two_pos(start, end);
-                            self.apply_rubber_band(drag_rect, &row_rects);
-                        }
-                        self.drag_select_start = None;
-                        self.drag_select_current = None;
-                    }
+                // Presses in an open dialog must not start a band behind it.
+                let dialog_open = self.password_prompt.is_some() || self.properties_item.is_some();
+                let frame = ctx.input(|i| PointerFrame {
+                    pressed_at: if i.pointer.primary_pressed() && !dialog_open {
+                        i.pointer.press_origin()
+                    } else {
+                        None
+                    },
+                    primary_down: i.pointer.primary_down(),
+                    hover: i.pointer.hover_pos(),
+                    additive: i.modifiers.ctrl,
                 });
+                // The visible part of the list: presses on the toolbar or
+                // address bar do not start a band.
+                let list_area = ui.clip_rect();
+                self.update_rubber_band(frame, list_area, &row_rects);
 
-                // Draw rubber-band rectangle
-                if let (Some(start), Some(end)) = (self.drag_select_start, self.drag_select_current) {
-                    let drag_rect = Rect::from_two_pos(start, end);
+                // Draw the band once it is a drag, not a click.
+                if let Some(band) = self.rubber_band_rect() {
                     ui.painter().rect(
-                        drag_rect,
+                        band,
                         0.0,
                         Color32::from_rgba_unmultiplied(60, 120, 220, 25),
                         egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 120, 220)),
                     );
                 }
-
-                // Drop panel_resp to suppress unused warning
-                drop(panel_resp);
 
                 // Apply deferred open / action
                 if let Some(item) = to_open {
@@ -1480,6 +1532,142 @@ mod keyboard_tests {
         app.anchor_index = Some(10); // e.g. the list shrank on refresh
         app.move_focus(true, false);
         assert_eq!(selected(&app), [2]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Mouse selection (OA-24) ──────────────────────────────────────────────
+    //
+    // These replay the per-frame order of `update()`: on the release frame the
+    // row click handler runs first, then `update_rubber_band`.
+
+    const ROW_H: f32 = 24.0;
+    const LIST_TOP: f32 = 100.0;
+
+    fn row_rects(rows: usize) -> Vec<(usize, Rect)> {
+        (0..rows)
+            .map(|i| {
+                let top = LIST_TOP + ROW_H * i as f32;
+                (i, Rect::from_min_size(egui::pos2(0.0, top), Vec2::new(300.0, ROW_H)))
+            })
+            .collect()
+    }
+
+    fn list_area() -> Rect {
+        Rect::from_min_max(egui::pos2(0.0, LIST_TOP - 30.0), egui::pos2(300.0, 600.0))
+    }
+
+    fn row_center(i: usize) -> egui::Pos2 {
+        egui::pos2(150.0, LIST_TOP + ROW_H * i as f32 + ROW_H / 2.0)
+    }
+
+    /// A click on row `idx`: press, then release with a 1 px jitter, with the
+    /// click handler (`on_click`) running on the release frame first.
+    fn click(app: &mut OpenArchiveGui, rows: &[(usize, Rect)], idx: usize, ctrl: bool, on_click: fn(&mut OpenArchiveGui, usize)) {
+        let at = row_center(idx);
+        let jitter = at + Vec2::new(1.0, 0.0);
+        app.update_rubber_band(
+            PointerFrame { pressed_at: Some(at), primary_down: true, hover: Some(at), additive: ctrl },
+            list_area(),
+            rows,
+        );
+        app.update_rubber_band(
+            PointerFrame { pressed_at: None, primary_down: true, hover: Some(jitter), additive: ctrl },
+            list_area(),
+            rows,
+        );
+        on_click(app, idx);
+        app.update_rubber_band(
+            PointerFrame { pressed_at: None, primary_down: false, hover: Some(jitter), additive: ctrl },
+            list_area(),
+            rows,
+        );
+    }
+
+    /// A drag from `from` to `to`, released at `to`.
+    fn drag(app: &mut OpenArchiveGui, rows: &[(usize, Rect)], from: egui::Pos2, to: egui::Pos2, ctrl: bool) {
+        app.update_rubber_band(
+            PointerFrame { pressed_at: Some(from), primary_down: true, hover: Some(from), additive: ctrl },
+            list_area(),
+            rows,
+        );
+        app.update_rubber_band(
+            PointerFrame { pressed_at: None, primary_down: true, hover: Some(to), additive: ctrl },
+            list_area(),
+            rows,
+        );
+        app.update_rubber_band(
+            PointerFrame { pressed_at: None, primary_down: false, hover: Some(to), additive: ctrl },
+            list_area(),
+            rows,
+        );
+    }
+
+    #[test]
+    fn ctrl_click_adds_to_and_removes_from_selection() {
+        let (dir, mut app) = app_in_dir("ctrl", 5);
+        let rows = row_rects(5);
+        click(&mut app, &rows, 0, false, OpenArchiveGui::select_single);
+        click(&mut app, &rows, 2, true, OpenArchiveGui::select_toggle);
+        click(&mut app, &rows, 4, true, OpenArchiveGui::select_toggle);
+        assert_eq!(selected(&app), [0, 2, 4]);
+        click(&mut app, &rows, 2, true, OpenArchiveGui::select_toggle);
+        assert_eq!(selected(&app), [0, 4]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shift_click_selects_from_anchor_to_clicked_row() {
+        let (dir, mut app) = app_in_dir("shift", 5);
+        let rows = row_rects(5);
+        click(&mut app, &rows, 1, false, OpenArchiveGui::select_single);
+        click(&mut app, &rows, 3, false, OpenArchiveGui::select_range_to);
+        assert_eq!(selected(&app), [1, 2, 3]);
+        // The anchor stays on row 1, so Shift-clicking above it flips the range.
+        click(&mut app, &rows, 0, false, OpenArchiveGui::select_range_to);
+        assert_eq!(selected(&app), [0, 1]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drag_selects_rows_and_ctrl_drag_adds() {
+        let (dir, mut app) = app_in_dir("drag", 6);
+        let rows = row_rects(6);
+        drag(&mut app, &rows, row_center(0), row_center(2), false);
+        assert_eq!(selected(&app), [0, 1, 2]);
+
+        // A plain drag replaces the selection...
+        drag(&mut app, &rows, row_center(4), row_center(5), false);
+        assert_eq!(selected(&app), [4, 5]);
+        // ...a Ctrl-drag adds to it.
+        drag(&mut app, &rows, row_center(0), row_center(1), true);
+        assert_eq!(selected(&app), [0, 1, 4, 5]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn press_outside_the_list_does_not_start_a_band() {
+        let (dir, mut app) = app_in_dir("outside", 3);
+        let rows = row_rects(3);
+        click(&mut app, &rows, 1, false, OpenArchiveGui::select_single);
+        // Press on the toolbar, drag down across the rows.
+        drag(&mut app, &rows, egui::pos2(150.0, 10.0), row_center(2), false);
+        assert_eq!(selected(&app), [1]);
+        assert!(app.rubber_band_rect().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shift_arrows_extend_from_the_anchor() {
+        let (dir, mut app) = app_in_dir("shiftarrows", 6);
+        app.select_single(1);
+        app.move_focus(true, true);
+        app.move_focus(true, true);
+        assert_eq!(selected(&app), [1, 2, 3]);
+        app.move_focus(false, true);
+        assert_eq!(selected(&app), [1, 2]);
+        // Plain arrow collapses to the focused row and moves on from it.
+        app.move_focus(true, false);
+        assert_eq!(selected(&app), [3]);
         let _ = fs::remove_dir_all(&dir);
     }
 }
