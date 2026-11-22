@@ -60,6 +60,9 @@ block-parallel paths).~~
 - Tests: 6 unit tests in `core::paths`, 4 CLI regression tests in `tests/cli_tests.rs`
   (`test_zip_slip_rejected`, `test_tar_slip_rejected`, `test_7z_slip_rejected`,
   `test_rooted_entry_extracts_inside_output_dir`).
+- Replaces the skip-and-warn fix from `07facff` (PR #1, `core::io::entry_target`): unsafe
+  entries now refuse the archive instead of being skipped, rooted names are kept inside the
+  output directory, and `.. ` / `:` names are also caught. Its traversal test was adapted.
 - Not covered here: a pre-existing symlink *inside* the output directory could still redirect
   writes; links in archives are not created today (see OA-7).
 
