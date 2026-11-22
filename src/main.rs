@@ -1,12 +1,72 @@
 use std::env;
 use std::fs;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::Path;
 use std::process;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use anyhow::Result;
 
 use openarchive::cli::{CliArgs, Command};
-use openarchive::core::{ArchiveFormat, CompressionOptions, ExtractOptions};
-use openarchive::formats::{create_archive, get_reader};
+use openarchive::core::{ArchiveFormat, CompressionOptions, Conflicts, Decision, ExtractOptions, OverwriteMode, Prompter};
+use openarchive::formats::{create_archive, get_reader, is_aborted};
+
+/// Asks on the terminal what to do with each existing file, like 7-Zip.
+/// "Always", "Skip all" and "Auto rename all" answer every later question.
+/// Without a terminal (scripts, pipes) it never blocks: the file is kept and
+/// a warning says how to choose.
+struct TerminalPrompter {
+    for_all: Mutex<Option<Decision>>,
+}
+
+impl Prompter for TerminalPrompter {
+    fn ask(&self, existing: &Path) -> Decision {
+        let mut for_all = self.for_all.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(decision) = *for_all {
+            return decision;
+        }
+        if !io::stdin().is_terminal() {
+            eprintln!(
+                "Warning: {} already exists; kept it (use -y or -aoa to overwrite, -aou to rename)",
+                existing.display()
+            );
+            return Decision::Skip;
+        }
+        loop {
+            eprint!(
+                "\nWould you like to replace the existing file:\n  {}\n? (Y)es / (N)o / (A)lways / (S)kip all / A(u)to rename all / (Q)uit? ",
+                existing.display()
+            );
+            let _ = io::stderr().flush();
+            let mut answer = String::new();
+            if io::stdin().lock().read_line(&mut answer).unwrap_or(0) == 0 {
+                return Decision::Skip; // end of input
+            }
+            let (decision, remember) = match answer.trim().to_lowercase().as_str() {
+                "y" | "yes" => (Decision::Overwrite, false),
+                "n" | "no" => (Decision::Skip, false),
+                "a" | "always" => (Decision::Overwrite, true),
+                "s" => (Decision::Skip, true),
+                "u" => (Decision::Rename, true),
+                "q" | "quit" => (Decision::Abort, false),
+                _ => continue,
+            };
+            if remember {
+                *for_all = Some(decision);
+            }
+            return decision;
+        }
+    }
+}
+
+/// `-aoa` / `-aos` / `-aou` win; otherwise `-y` overwrites; otherwise ask.
+fn conflicts_for(args: &CliArgs) -> Conflicts {
+    match (args.overwrite_mode, args.assume_yes) {
+        (Some(mode), _) => Conflicts::new(mode),
+        (None, true) => Conflicts::new(OverwriteMode::Overwrite),
+        (None, false) => Conflicts::asking(Arc::new(TerminalPrompter { for_all: Mutex::new(None) })),
+    }
+}
 use openarchive::gui::run_gui;
 
 fn print_banner() {
@@ -33,7 +93,8 @@ fn print_help() {
     println!("  -ms={{on|off}} : Enable/disable solid compression (-ms=on, -ms=off)");
     println!("  -mmt={{N|on|off}}: Set CPU thread count (-mmt=on, -mmt=1, -mmt=4)");
     println!("  -r           : Recurse subdirectories");
-    println!("  -y           : Assume Yes on all queries");
+    println!("  -y           : Assume Yes on all queries (overwrite existing files)");
+    println!("  -ao{{a|s|u}}   : Existing files: a=overwrite all, s=skip, u=rename new files");
     println!();
     println!("Supported Formats: .7z, .zip, .tar, .tar.gz, .tar.bz2, .tar.xz");
 }
@@ -166,11 +227,12 @@ fn main() -> Result<()> {
             let filter_strings: Vec<String> = args.files.iter().map(|p| p.to_string_lossy().to_string()).collect();
             let filter = if filter_strings.is_empty() { None } else { Some(filter_strings.as_slice()) };
 
+            let conflicts = Arc::new(conflicts_for(&args));
             let extract_opts = ExtractOptions {
                 output_dir: args.output_dir,
                 flat: is_flat,
                 password: args.password,
-                overwrite: true,
+                conflicts: conflicts.clone(),
                 threads: args.threads,
                 progress: None,
             };
@@ -179,9 +241,21 @@ fn main() -> Result<()> {
                 println!("Multithreading: {} threads", th);
             }
 
-            reader.extract(&extract_opts, filter)?;
+            if let Err(err) = reader.extract(&extract_opts, filter) {
+                if is_aborted(&err) {
+                    eprintln!("\nExtraction stopped; files already extracted are kept.");
+                    process::exit(255); // 7-Zip's code for "stopped by the user"
+                }
+                return Err(err);
+            }
 
             println!("\nExtracted in {:.2?}", start_time.elapsed());
+            if conflicts.skipped() > 0 {
+                println!("Existing files kept: {}", conflicts.skipped());
+            }
+            if conflicts.renamed() > 0 {
+                println!("Extracted under a new name: {}", conflicts.renamed());
+            }
             println!("Everything is Ok");
         }
 

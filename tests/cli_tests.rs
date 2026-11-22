@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sevenz_rust2::Archive;
@@ -1525,6 +1525,82 @@ fn test_misnamed_archive_is_opened_by_content() {
         .unwrap();
     assert!(extracted.status.success(), "{}", String::from_utf8_lossy(&extracted.stderr));
     assert_eq!(fs::read(out.join("src/a.txt")).unwrap(), b"by content");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ─── Existing files (OA-9) ──────────────────────────────────────────────────
+
+/// Creates `<dir>/a.zip` holding `src/a.txt` = "new", and returns a function
+/// that extracts it into `<dir>/out` (where `src/a.txt` = "old") with
+/// `switches`, returning (success, stdout, stderr).
+fn overwrite_fixture(dir: &Path) -> impl Fn(&[&str]) -> (bool, String, String) + '_ {
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/a.txt"), b"new").unwrap();
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    assert!(Command::new(exe).current_dir(dir).args(["a", "a.zip", "src"]).output().unwrap().status.success());
+
+    move |switches: &[&str]| {
+        let out = dir.join("out");
+        let _ = fs::remove_dir_all(&out);
+        fs::create_dir_all(out.join("src")).unwrap();
+        fs::write(out.join("src/a.txt"), b"old").unwrap();
+        let output = Command::new(exe)
+            .args(["x", dir.join("a.zip").to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .args(switches)
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+}
+
+#[test]
+fn test_existing_files_without_a_terminal_are_kept_with_a_warning() {
+    let dir = PathBuf::from("test_ow_default");
+    let extract = overwrite_fixture(&dir);
+    // No terminal on stdin (as in scripts): must not block, keeps the file.
+    let (ok, stdout, stderr) = extract(&[]);
+    assert!(ok, "{stderr}");
+    assert!(stderr.contains("already exists; kept it"), "{stderr}");
+    assert!(stdout.contains("Existing files kept: 1"), "{stdout}");
+    assert_eq!(fs::read(dir.join("out/src/a.txt")).unwrap(), b"old");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_overwrite_switches() {
+    let dir = PathBuf::from("test_ow_switches");
+    let extract = overwrite_fixture(&dir);
+    let read = |name: &str| fs::read(dir.join("out/src").join(name)).ok();
+
+    for switch in ["-y", "-aoa"] {
+        let (ok, _, stderr) = extract(&[switch]);
+        assert!(ok && !stderr.contains("Warning"), "{switch}: {stderr}");
+        assert_eq!(read("a.txt").unwrap(), b"new", "{switch}");
+    }
+
+    let (ok, stdout, stderr) = extract(&["-aos"]);
+    assert!(ok && !stderr.contains("Warning"), "-aos: {stderr}");
+    assert_eq!(read("a.txt").unwrap(), b"old");
+    assert!(stdout.contains("Existing files kept: 1"), "{stdout}");
+
+    let (ok, stdout, _) = extract(&["-aou"]);
+    assert!(ok);
+    assert_eq!(read("a.txt").unwrap(), b"old");
+    assert_eq!(read("a (1).txt").unwrap(), b"new");
+    assert!(stdout.contains("Extracted under a new name: 1"), "{stdout}");
+
+    // An unknown -ao mode (7-Zip's -aot renames the existing file) is an
+    // error, not silently ignored.
+    let (ok, _, stderr) = extract(&["-aot"]);
+    assert!(!ok);
+    assert!(stderr.contains("unsupported switch -aot"), "{stderr}");
+    assert_eq!(read("a.txt").unwrap(), b"old");
 
     let _ = fs::remove_dir_all(&dir);
 }

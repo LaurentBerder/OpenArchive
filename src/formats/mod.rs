@@ -56,7 +56,7 @@ pub enum PasswordProblem {
 /// A cancellation is never a password problem, even though sevenz-rust2
 /// reports any I/O error during an encrypted read as `MaybeBadPassword`.
 pub fn password_problem(err: &anyhow::Error) -> Option<PasswordProblem> {
-    if is_cancelled(err) {
+    if is_cancelled(err) || is_aborted(err) {
         return None;
     }
     err.chain().find_map(classify_password_error)
@@ -69,25 +69,59 @@ pub fn password_problem(err: &anyhow::Error) -> Option<PasswordProblem> {
 /// sevenz-rust2 wraps in variants that expose no `source()`; those are opened
 /// explicitly.
 pub fn is_cancelled(err: &anyhow::Error) -> bool {
-    err.chain().any(error_is_cancelled)
+    err.chain().any(contains::<crate::core::Cancelled>)
 }
 
-fn error_is_cancelled(err: &(dyn std::error::Error + 'static)) -> bool {
-    if err.is::<crate::core::Cancelled>() {
+/// Whether an extraction stopped because the user answered "Quit" to an
+/// overwrite question ([`crate::core::Aborted`]).
+pub fn is_aborted(err: &anyhow::Error) -> bool {
+    err.chain().any(contains::<crate::core::Aborted>)
+}
+
+/// Whether `err` is a `T` or carries one inside an `io::Error`, including
+/// through sevenz-rust2's wrappers, which expose no `source()`.
+fn contains<T: std::error::Error + 'static>(err: &(dyn std::error::Error + 'static)) -> bool {
+    if err.is::<T>() {
         return true;
     }
     if let Some(err) = err.downcast_ref::<std::io::Error>() {
-        return err.get_ref().is_some_and(|inner| error_is_cancelled(inner));
+        return err.get_ref().is_some_and(|inner| contains::<T>(inner));
     }
     if let Some(err) = err.downcast_ref::<sevenz_rust2::Error>() {
         return match err {
             sevenz_rust2::Error::Io(inner, _)
             | sevenz_rust2::Error::FileOpen(inner, _)
-            | sevenz_rust2::Error::MaybeBadPassword(inner) => error_is_cancelled(inner),
+            | sevenz_rust2::Error::MaybeBadPassword(inner) => contains::<T>(inner),
             _ => false,
         };
     }
     false
+}
+
+/// Files that extracting `archive` with `options` would overwrite: existing
+/// files at the targets of the entries `filter` selects. Used to ask once,
+/// before extracting, what to do with them.
+pub fn existing_targets(
+    archive: &Path,
+    password: Option<String>,
+    options: &crate::core::ExtractOptions,
+    filter: Option<&[String]>,
+) -> Result<Vec<PathBuf>> {
+    let entries = get_reader(archive, password)?.list()?;
+    let mut existing = Vec::new();
+    for entry in entries.iter().filter(|entry| !entry.is_dir) {
+        if !crate::core::paths::matches_filter(filter, &entry.name) {
+            continue;
+        }
+        if let Some(target) = crate::core::paths::entry_target(&options.output_dir, &entry.name, options.flat)?
+            && target.is_file()
+        {
+            existing.push(target);
+        }
+    }
+    existing.sort();
+    existing.dedup();
+    Ok(existing)
 }
 
 fn classify_password_error(err: &(dyn std::error::Error + 'static)) -> Option<PasswordProblem> {
@@ -437,6 +471,117 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("out/a.txt")).unwrap(), b"one");
         // Only the indexed (parallel) path knows the total up front.
         assert_eq!(progress.total(), Some(3 + 200_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Existing files (OA-9) ────────────────────────────────────────────────
+
+    use crate::core::{Conflicts, Decision, OverwriteMode, Prompter};
+
+    struct AlwaysAnswer(Decision);
+    impl Prompter for AlwaysAnswer {
+        fn ask(&self, _existing: &Path) -> Decision {
+            self.0
+        }
+    }
+
+    /// Extracts the `progress_archive` into `out`, where `src/a.txt` already
+    /// exists with "old".
+    fn extract_over_existing(
+        archive: &Path,
+        out: &Path,
+        threads: usize,
+        conflicts: Conflicts,
+        password: Option<&str>,
+    ) -> (Result<()>, Arc<Conflicts>, Arc<Progress>) {
+        let _ = std::fs::remove_dir_all(out);
+        std::fs::create_dir_all(out.join("src")).unwrap();
+        std::fs::write(out.join("src/a.txt"), b"old").unwrap();
+        let conflicts = Arc::new(conflicts);
+        let progress = Arc::new(Progress::new());
+        let options = ExtractOptions {
+            output_dir: out.to_path_buf(),
+            password: password.map(String::from),
+            threads: Some(threads),
+            conflicts: conflicts.clone(),
+            progress: Some(progress.clone()),
+            ..Default::default()
+        };
+        let result = get_reader(archive, password.map(String::from)).unwrap().extract(&options, None);
+        (result, conflicts, progress)
+    }
+
+    #[test]
+    fn existing_files_follow_the_overwrite_mode() {
+        for ext in ["zip", "7z", "tar", "tar.gz"] {
+            for threads in [1, 4] {
+                let (dir, archive) = progress_archive(&format!("ow-{}", ext.replace('.', "")), ext, None);
+                let out = dir.join("out");
+                let label = format!("{ext} t{threads}");
+                let fresh = vec![b'x'; 10_000];
+
+                let (result, _, _) = extract_over_existing(&archive, &out, threads, Conflicts::new(OverwriteMode::Overwrite), None);
+                result.unwrap();
+                assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), fresh, "{label}: overwrite");
+
+                let (result, conflicts, progress) =
+                    extract_over_existing(&archive, &out, threads, Conflicts::new(OverwriteMode::Skip), None);
+                result.unwrap();
+                assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"old", "{label}: skip");
+                assert!(out.join("src/big.bin").exists(), "{label}: the rest is extracted");
+                assert_eq!(conflicts.skipped(), 1, "{label}");
+                // The skipped file is not counted, so the bar still ends full.
+                if let Some(total) = progress.total() {
+                    assert_eq!(total, PAYLOAD_BYTES - 10_000, "{label}: total");
+                    assert_eq!(progress.done(), total, "{label}: done");
+                }
+
+                let (result, conflicts, _) =
+                    extract_over_existing(&archive, &out, threads, Conflicts::new(OverwriteMode::Rename), None);
+                result.unwrap();
+                assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"old", "{label}: rename keeps");
+                assert_eq!(std::fs::read(out.join("src/a (1).txt")).unwrap(), fresh, "{label}: rename new");
+                assert_eq!(conflicts.renamed(), 1, "{label}");
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    #[test]
+    fn quitting_at_the_prompt_stops_extraction() {
+        for (ext, password) in [("zip", None), ("7z", None), ("7z", Some("pw")), ("tar.gz", None)] {
+            for threads in [1, 4] {
+                let (dir, archive) = progress_archive(&format!("quit-{}", ext.replace('.', "")), ext, password);
+                let out = dir.join("out");
+                let label = format!("{ext} pw={password:?} t{threads}");
+
+                let conflicts = Conflicts::asking(Arc::new(AlwaysAnswer(Decision::Abort)));
+                let (result, _, _) = extract_over_existing(&archive, &out, threads, conflicts, password);
+                let err = result.unwrap_err();
+                assert!(is_aborted(&err), "{label}: {err:#}");
+                // sevenz-rust2 rewraps errors in encrypted reads as
+                // MaybeBadPassword; quitting must not read as a wrong password.
+                assert_eq!(password_problem(&err), None, "{label}: {err:#}");
+                assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"old", "{label}");
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    #[test]
+    fn existing_targets_lists_only_files_that_would_be_replaced() {
+        let (dir, archive) = progress_archive("existing", "7z", None);
+        let out = dir.join("out");
+        std::fs::create_dir_all(out.join("src")).unwrap();
+        std::fs::write(out.join("src/a.txt"), b"old").unwrap();
+        std::fs::write(out.join("unrelated.txt"), b"x").unwrap();
+        let options = ExtractOptions { output_dir: out.clone(), ..Default::default() };
+
+        assert_eq!(existing_targets(&archive, None, &options, None).unwrap(), [out.join("src").join("a.txt")]);
+        let filter = ["src/big.bin".to_string()];
+        assert!(existing_targets(&archive, None, &options, Some(&filter)).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

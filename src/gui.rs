@@ -6,8 +6,8 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::time::Instant;
 use eframe::egui::{self, Color32, FontId, Key, PointerButton, Rect, RichText, Sense, Vec2};
 
-use crate::core::{ArchiveEntry, ArchiveFormat, ExtractOptions, Progress};
-use crate::formats::{get_reader, is_cancelled, password_problem};
+use crate::core::{ArchiveEntry, ArchiveFormat, Conflicts, ExtractOptions, OverwriteMode, Progress};
+use crate::formats::{existing_targets, get_reader, is_cancelled, password_problem};
 
 // ─── Navigation Location ──────────────────────────────────────────────────────
 
@@ -53,9 +53,11 @@ enum ArchiveOp {
     /// Extract one file to the temp folder and open it.
     Preview { full_internal: String, file_name: String, open_with: bool },
     /// Extract one item into `dest`: a file without its path, a folder with it.
-    ExtractItem { full_internal: String, name: String, is_dir: bool, dest: PathBuf },
-    /// Extract the whole archive into `dest`.
-    ExtractAll { dest: PathBuf },
+    /// `overwrite` is `None` until the user chose what to do with existing
+    /// files (asked only if there are any).
+    ExtractItem { full_internal: String, name: String, is_dir: bool, dest: PathBuf, overwrite: Option<OverwriteMode> },
+    /// Extract the whole archive into `dest`; `overwrite` as above.
+    ExtractAll { dest: PathBuf, overwrite: Option<OverwriteMode> },
     /// Decompress every entry and verify its checksum, writing nothing.
     Test,
 }
@@ -67,8 +69,11 @@ enum OpOutcome {
     Listed(Vec<ArchiveEntry>),
     /// `ArchiveOp::Preview`: the extracted file, to open on the UI thread.
     Previewed(PathBuf),
-    /// Extraction or test finished, with any entries it skipped.
+    /// Extraction or test finished, with notes (skipped entries, kept or
+    /// renamed files).
     Done(Vec<String>),
+    /// Nothing written yet: these files already exist, ask what to do.
+    Conflicts(Vec<PathBuf>),
 }
 
 /// An archive operation running on a worker thread.
@@ -101,13 +106,14 @@ fn op_label(archive_path: &Path, op: &ArchiveOp) -> String {
     }
 }
 
-/// Appends skipped entries to a completion message, e.g.
-/// "Extracted to out (2 entries skipped: skipped symbolic link a -> b; …)".
-fn with_warnings(message: String, warnings: &[String]) -> String {
-    match warnings {
+/// Appends notes to a completion message, e.g. "Extracted to out (3
+/// existing files kept)" or "Extracted to out (skipped symbolic link a ->
+/// b; +2 more)".
+fn with_warnings(message: String, notes: &[String]) -> String {
+    match notes {
         [] => message,
-        [only] => format!("{message} (1 entry skipped: {only})"),
-        [first, rest @ ..] => format!("{message} ({} entries skipped: {first}; …)", rest.len() + 1),
+        [only] => format!("{message} ({only})"),
+        [first, rest @ ..] => format!("{message} ({first}; +{} more)", rest.len()),
     }
 }
 
@@ -125,6 +131,15 @@ fn format_bytes(bytes: u64) -> String {
     }
     let decimals = if unit >= 2 { 2 } else { 1 };
     format!("{value:.decimals$} {}", UNITS[unit])
+}
+
+/// State of the "files already exist" dialog.
+#[derive(Debug)]
+struct ConflictPrompt {
+    archive_path: PathBuf,
+    /// The extraction to re-run once the user chose.
+    op: ArchiveOp,
+    existing: Vec<PathBuf>,
 }
 
 /// State of the "password required" dialog.
@@ -195,6 +210,8 @@ pub struct OpenArchiveGui {
 
     /// Archive operations running on worker threads (OA-5).
     running_ops: Vec<RunningOp>,
+    /// Open "files already exist" dialog, if any.
+    conflict_prompt: Option<ConflictPrompt>,
     /// The "operation in progress, quit anyway?" dialog is open.
     confirm_quit: bool,
     /// Quit once the cancelled operations have stopped.
@@ -370,6 +387,7 @@ impl OpenArchiveGui {
             passwords: HashMap::new(),
             password_prompt: None,
             running_ops: Vec::new(),
+            conflict_prompt: None,
             confirm_quit: false,
             quit_when_idle: false,
             repaint,
@@ -835,9 +853,16 @@ impl OpenArchiveGui {
                 let message = format!("Extracted {} to {}", name, dest.display());
                 self.show_notification(with_warnings(message, &warnings));
             }
-            (ArchiveOp::ExtractAll { dest }, OpOutcome::Done(warnings)) => {
+            (ArchiveOp::ExtractAll { dest, .. }, OpOutcome::Done(warnings)) => {
                 let message = format!("Extracted to {}", dest.display());
                 self.show_notification(with_warnings(message, &warnings));
+            }
+            (ArchiveOp::ExtractItem { .. } | ArchiveOp::ExtractAll { .. }, OpOutcome::Conflicts(existing)) => {
+                self.conflict_prompt = Some(ConflictPrompt {
+                    archive_path: archive_path.to_path_buf(),
+                    op: op.clone(),
+                    existing,
+                });
             }
             (ArchiveOp::Test, OpOutcome::Done(warnings)) => {
                 let message = format!("{archive_name}: Everything is Ok");
@@ -854,6 +879,80 @@ impl OpenArchiveGui {
         };
         self.passwords.insert(prompt.archive_path.clone(), prompt.input);
         self.run_archive_op(prompt.archive_path, prompt.op);
+    }
+
+    /// Re-runs the extraction that found existing files, with the user's
+    /// choice; `None` cancels it.
+    fn resolve_conflicts(&mut self, choice: Option<OverwriteMode>) {
+        let Some(prompt) = self.conflict_prompt.take() else {
+            return;
+        };
+        let Some(mode) = choice else {
+            self.show_notification("Extraction cancelled");
+            return;
+        };
+        let op = match prompt.op {
+            ArchiveOp::ExtractItem { full_internal, name, is_dir, dest, .. } => {
+                ArchiveOp::ExtractItem { full_internal, name, is_dir, dest, overwrite: Some(mode) }
+            }
+            ArchiveOp::ExtractAll { dest, .. } => ArchiveOp::ExtractAll { dest, overwrite: Some(mode) },
+            other => other,
+        };
+        self.run_archive_op(prompt.archive_path, op);
+    }
+
+    fn show_conflict_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &self.conflict_prompt else {
+            return;
+        };
+        let count = prompt.existing.len();
+        let names: Vec<String> = prompt
+            .existing
+            .iter()
+            .take(5)
+            .map(|path| path.file_name().unwrap_or_default().to_string_lossy().to_string())
+            .collect();
+
+        let mut choice: Option<Option<OverwriteMode>> = None;
+        egui::Window::new("Files already exist")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(if count == 1 {
+                    "1 file already exists in the destination:".to_string()
+                } else {
+                    format!("{count} files already exist in the destination:")
+                });
+                for name in &names {
+                    ui.label(RichText::new(format!("  • {name}")).color(Color32::GRAY));
+                }
+                if count > names.len() {
+                    ui.label(RichText::new(format!("  … and {} more", count - names.len())).color(Color32::GRAY));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Overwrite all").on_hover_text("Replace the existing files").clicked() {
+                        choice = Some(Some(OverwriteMode::Overwrite));
+                    }
+                    if ui.button("Skip existing").on_hover_text("Keep the existing files; extract the rest").clicked() {
+                        choice = Some(Some(OverwriteMode::Skip));
+                    }
+                    if ui.button("Keep both").on_hover_text("Extract the new files as \"name (1).ext\"").clicked() {
+                        choice = Some(Some(OverwriteMode::Rename));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(None);
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            choice = Some(None);
+        }
+        if let Some(choice) = choice {
+            self.resolve_conflicts(choice);
+        }
     }
 
     fn show_quit_confirmation(&mut self, ctx: &egui::Context) {
@@ -1061,6 +1160,7 @@ impl OpenArchiveGui {
                                 name: item.name.clone(),
                                 is_dir: item.is_dir,
                                 dest,
+                                overwrite: None,
                             };
                             self.run_archive_op(arc, op);
                         }
@@ -1075,7 +1175,7 @@ impl OpenArchiveGui {
         if let NavLocation::Archive { archive_path, .. } = &self.current_location {
             let arc = archive_path.clone();
             if let Some(dest) = rfd::FileDialog::new().pick_folder() {
-                self.run_archive_op(arc, ArchiveOp::ExtractAll { dest });
+                self.run_archive_op(arc, ArchiveOp::ExtractAll { dest, overwrite: None });
             }
         }
     }
@@ -1145,13 +1245,25 @@ fn perform_archive_op(
     progress: Arc<Progress>,
 ) -> anyhow::Result<OpOutcome> {
     let mut reader = get_reader(archive_path, password.clone())?;
-    let extract_options = |output_dir: PathBuf, flat: bool| ExtractOptions {
+    let extract_options = |output_dir: PathBuf, flat: bool, mode: OverwriteMode| ExtractOptions {
         output_dir,
         flat,
         password: password.clone(),
-        overwrite: true,
+        conflicts: Arc::new(Conflicts::new(mode)),
         threads: None,
         progress: Some(progress.clone()),
+    };
+    // Extraction notes for the completion message.
+    let notes = |options: &ExtractOptions| {
+        let mut notes = progress.warnings();
+        let (kept, renamed) = (options.conflicts.skipped(), options.conflicts.renamed());
+        if kept > 0 {
+            notes.push(format!("{kept} existing file{} kept", if kept == 1 { "" } else { "s" }));
+        }
+        if renamed > 0 {
+            notes.push(format!("{renamed} file{} saved under a new name", if renamed == 1 { "" } else { "s" }));
+        }
+        notes
     };
 
     match op {
@@ -1161,7 +1273,8 @@ fn perform_archive_op(
             let temp_dir = std::env::temp_dir().join("OpenArchive").join(arc_stem.as_ref());
             fs::create_dir_all(&temp_dir)?;
             let filter = [full_internal.clone()];
-            reader.extract(&extract_options(temp_dir.clone(), true), Some(&filter))?;
+            // The temp copy of an earlier preview is simply replaced.
+            reader.extract(&extract_options(temp_dir.clone(), true, OverwriteMode::Overwrite), Some(&filter))?;
 
             let target_file = temp_dir.join(file_name);
             if !target_file.exists() {
@@ -1169,14 +1282,28 @@ fn perform_archive_op(
             }
             Ok(OpOutcome::Previewed(target_file))
         }
-        ArchiveOp::ExtractItem { full_internal, is_dir, dest, .. } => {
+        ArchiveOp::ExtractItem { full_internal, is_dir, dest, overwrite, .. } => {
             let filter = [full_internal.clone()];
-            reader.extract(&extract_options(dest.clone(), !is_dir), Some(&filter))?;
-            Ok(OpOutcome::Done(progress.warnings()))
+            let options = extract_options(dest.clone(), !is_dir, overwrite.unwrap_or(OverwriteMode::Overwrite));
+            if overwrite.is_none() {
+                let existing = existing_targets(archive_path, password.clone(), &options, Some(&filter))?;
+                if !existing.is_empty() {
+                    return Ok(OpOutcome::Conflicts(existing));
+                }
+            }
+            reader.extract(&options, Some(&filter))?;
+            Ok(OpOutcome::Done(notes(&options)))
         }
-        ArchiveOp::ExtractAll { dest } => {
-            reader.extract(&extract_options(dest.clone(), false), None)?;
-            Ok(OpOutcome::Done(progress.warnings()))
+        ArchiveOp::ExtractAll { dest, overwrite } => {
+            let options = extract_options(dest.clone(), false, overwrite.unwrap_or(OverwriteMode::Overwrite));
+            if overwrite.is_none() {
+                let existing = existing_targets(archive_path, password.clone(), &options, None)?;
+                if !existing.is_empty() {
+                    return Ok(OpOutcome::Conflicts(existing));
+                }
+            }
+            reader.extract(&options, None)?;
+            Ok(OpOutcome::Done(notes(&options)))
         }
         ArchiveOp::Test => {
             reader.test(password.as_deref(), Some(&progress))?;
@@ -1265,6 +1392,7 @@ impl eframe::App for OpenArchiveGui {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.show_quit_confirmation(ctx);
+        self.show_conflict_prompt(ctx);
 
         // Grab modifier state for use in item rows below
         let (ctrl_down, shift_down) = ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
@@ -1272,7 +1400,7 @@ impl eframe::App for OpenArchiveGui {
         // ── 1. GLOBAL KEYBOARD & MOUSE BUTTON HANDLERS ───────────────────────
         // Disabled while the password dialog has the keyboard: Backspace and
         // Enter there must not navigate or open items.
-        let shortcuts_enabled = self.password_prompt.is_none();
+        let shortcuts_enabled = self.password_prompt.is_none() && self.conflict_prompt.is_none();
         ctx.input(|i| {
             if !shortcuts_enabled { return; }
             if i.pointer.button_clicked(PointerButton::Extra1) { self.navigate_up_or_back(); }
@@ -1597,7 +1725,7 @@ impl eframe::App for OpenArchiveGui {
 
                 // ── Rubber-band drag selection ─────────────────────────────────
                 // Presses in an open dialog must not start a band behind it.
-                let dialog_open = self.password_prompt.is_some() || self.properties_item.is_some();
+                let dialog_open = self.password_prompt.is_some() || self.properties_item.is_some() || self.conflict_prompt.is_some();
                 let frame = ctx.input(|i| PointerFrame {
                     pressed_at: if i.pointer.primary_pressed() && !dialog_open {
                         i.pointer.press_origin()
@@ -1796,7 +1924,7 @@ mod tests {
         assert_eq!(item_names(&app), ["a.txt"]);
 
         let dest = dir.join("all");
-        app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dest.clone() });
+        app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dest.clone(), overwrite: None });
         app.wait_idle();
         assert!(app.password_prompt.is_none());
         assert_eq!(fs::read(dest.join("src/a.txt")).unwrap(), PAYLOAD);
@@ -1814,6 +1942,7 @@ mod tests {
             name: "a.txt".into(),
             is_dir: false,
             dest: dest.clone(),
+            overwrite: None,
         };
 
         app.run_archive_op(archive.clone(), op.clone());
@@ -1951,7 +2080,7 @@ mod tests {
         let mut app = open_at(&archive);
         let dest = dir.join("bg-out");
 
-        app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dest.clone() });
+        app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dest.clone(), overwrite: None });
         // The call returned without applying anything: the result is only
         // picked up by the per-frame poll.
         assert_eq!(app.running_ops.len(), 1);
@@ -1994,7 +2123,7 @@ mod tests {
         let mut app = open_at(&archive);
 
         app.run_archive_op(archive.clone(), ArchiveOp::Test);
-        app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dir.join("many-out") });
+        app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dir.join("many-out"), overwrite: None });
         let busy = app.busy_label().unwrap();
         assert!(busy.starts_with("Testing archive.7z…") && busy.ends_with("(+1 more)"), "{busy}");
 
@@ -2012,7 +2141,7 @@ mod tests {
         let progress = Arc::new(Progress::new());
         app.running_ops.push(RunningOp {
             archive_path: archive.to_path_buf(),
-            op: ArchiveOp::ExtractAll { dest: PathBuf::from("dest") },
+            op: ArchiveOp::ExtractAll { dest: PathBuf::from("dest"), overwrite: None },
             password: None,
             started: Instant::now(),
             progress: progress.clone(),
@@ -2061,7 +2190,7 @@ mod tests {
         ));
         app.finish_archive_op(
             PathBuf::from("secret.7z"),
-            ArchiveOp::ExtractAll { dest: PathBuf::from("dest") },
+            ArchiveOp::ExtractAll { dest: PathBuf::from("dest"), overwrite: None },
             Some("right".into()),
             Err(anyhow::Error::new(cancelled)),
         );
@@ -2086,6 +2215,64 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(120 * 1024 * 1024), "120.0 MB");
         assert_eq!(format_bytes(3 * 1024 * 1024 * 1024 / 2), "1.50 GB");
+    }
+
+    // ── Existing files (OA-9) ────────────────────────────────────────────────
+
+    /// The `make_archive` fixture, extracted once already into `dest` and
+    /// edited, so extracting again finds `src/a.txt` existing.
+    fn archive_with_existing_output(tag: &str) -> (PathBuf, PathBuf, PathBuf, OpenArchiveGui) {
+        let (dir, archive) = make_archive(tag, None);
+        let dest = dir.join("dest");
+        fs::create_dir_all(dest.join("src")).unwrap();
+        fs::write(dest.join("src/a.txt"), b"edited").unwrap();
+        let app = open_at(&archive);
+        (dir, archive, dest, app)
+    }
+
+    #[test]
+    fn existing_files_open_one_dialog_before_anything_is_written() {
+        let (dir, archive, dest, mut app) = archive_with_existing_output("conflict-ask");
+        app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dest.clone(), overwrite: None });
+        app.wait_idle();
+
+        let prompt = app.conflict_prompt.as_ref().expect("dialog should be open");
+        assert_eq!(prompt.existing, [dest.join("src").join("a.txt")]);
+        assert_eq!(fs::read(dest.join("src/a.txt")).unwrap(), b"edited", "nothing written yet");
+
+        app.resolve_conflicts(None); // Cancel
+        app.wait_idle();
+        assert!(app.conflict_prompt.is_none());
+        assert_eq!(notification_text(&app), "Extraction cancelled");
+        assert_eq!(fs::read(dest.join("src/a.txt")).unwrap(), b"edited");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dialog_choices_are_applied() {
+        for (mode, kept, renamed_to) in [
+            (OverwriteMode::Overwrite, PAYLOAD, None),
+            (OverwriteMode::Skip, &b"edited"[..], None),
+            (OverwriteMode::Rename, &b"edited"[..], Some("a (1).txt")),
+        ] {
+            let (dir, archive, dest, mut app) = archive_with_existing_output(&format!("conflict-{mode:?}"));
+            app.run_archive_op(archive.clone(), ArchiveOp::ExtractAll { dest: dest.clone(), overwrite: None });
+            app.wait_idle();
+            app.resolve_conflicts(Some(mode));
+            app.wait_idle();
+
+            assert_eq!(fs::read(dest.join("src/a.txt")).unwrap(), kept, "{mode:?}");
+            let note = notification_text(&app);
+            match mode {
+                OverwriteMode::Overwrite => assert_eq!(note, format!("Extracted to {}", dest.display())),
+                OverwriteMode::Skip => assert!(note.ends_with("(1 existing file kept)"), "{note}"),
+                _ => assert!(note.ends_with("(1 file saved under a new name)"), "{note}"),
+            }
+            if let Some(renamed) = renamed_to {
+                assert_eq!(fs::read(dest.join("src").join(renamed)).unwrap(), PAYLOAD);
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }
 
