@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use walkdir::WalkDir;
 
 use crate::core::io as file_io;
+use crate::core::paths;
 use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
 
 const MB: u64 = 1024 * 1024;
@@ -200,11 +201,10 @@ impl ArchiveReader for SevenZHandler {
                 }
             }
 
-            // Unsafe names are reported here; the extraction passes below skip
-            // them silently.
-            let Some(target_path) = file_io::entry_target(&options.output_dir, name, options.flat)
+            // This pass sees every name first, so an unsafe one refuses the
+            // archive before anything is written.
+            let Some(target_path) = paths::entry_target(&options.output_dir, name, options.flat)?
             else {
-                file_io::warn_unsafe_entry(name);
                 continue;
             };
 
@@ -260,7 +260,7 @@ impl ArchiveReader for SevenZHandler {
 
                 if !entry.is_directory() {
                     let Some(target_path) =
-                        file_io::entry_target(&options.output_dir, name, options.flat)
+                        paths::entry_target(&options.output_dir, name, options.flat)?
                     else {
                         return Ok(true);
                     };
@@ -331,7 +331,7 @@ impl ArchiveReader for SevenZHandler {
 
                     if !entry.is_directory() {
                         let Some(target_path) =
-                            file_io::entry_target(&options.output_dir, name, options.flat)
+                            paths::entry_target(&options.output_dir, name, options.flat)?
                         else {
                             return Ok(true);
                         };
@@ -519,7 +519,7 @@ fn extract_blocks_parallel(
 
                         if !entry.is_directory() {
                             let Some(target_path) =
-                                file_io::entry_target(&options.output_dir, name, options.flat)
+                                paths::entry_target(&options.output_dir, name, options.flat)?
                             else {
                                 return Ok(true);
                             };

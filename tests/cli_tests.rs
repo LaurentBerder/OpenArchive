@@ -498,30 +498,37 @@ fn test_extraction_rejects_path_traversal() {
         .to_string();
 
     let exe = env!("CARGO_BIN_EXE_openarchive");
-    let check = |archive: &PathBuf, extra_args: &[&str], label: &str| {
+    // Extraction must refuse the archive and nothing may land outside the
+    // output directory. With `up_front`, the format sees every name before
+    // writing (zip, 7z, indexed plain TAR), so not even the safe entry that
+    // comes first may be written; streamed TAR stops at the bad entry.
+    let check = |command: &str, archive: &PathBuf, extra_args: &[&str], label: &str, up_front: bool| {
         let _ = fs::remove_dir_all(&out_dir);
         let mut args = vec![
-            "x".to_string(),
+            command.to_string(),
             archive.to_string_lossy().to_string(),
             "-o".to_string(),
             out_dir.to_string_lossy().to_string(),
         ];
         args.extend(extra_args.iter().map(|s| s.to_string()));
         let output = Command::new(exe).args(&args).output().unwrap();
-        assert!(output.status.success(), "{label}: extraction failed");
+        assert!(!output.status.success(), "{label}: extraction should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("outside the output directory"),
-            "{label}: expected a warning"
-        );
-        assert_eq!(
-            fs::read_to_string(out_dir.join("safe").join("ok.txt")).unwrap(),
-            "safe",
-            "{label}: safe entry must still be extracted"
+            stderr.contains("unsafe archive entry"),
+            "{label}: unexpected error: {stderr}"
         );
         for escaped in ["escape.txt", "escape2.txt", "abs_escape.txt"] {
             assert!(
                 !sandbox.join(escaped).exists(),
                 "{label}: {escaped} escaped the output directory"
+            );
+        }
+        if up_front {
+            // `x` would write safe/ok.txt, flat `e` would write ok.txt.
+            assert!(
+                !out_dir.join("safe").join("ok.txt").exists() && !out_dir.join("ok.txt").exists(),
+                "{label}: nothing should be written before refusing"
             );
         }
     };
@@ -535,13 +542,13 @@ fn test_extraction_rejects_path_traversal() {
     ]);
     let tar_path = sandbox.join("slip.tar");
     fs::write(&tar_path, &tar_bytes).unwrap();
-    check(&tar_path, &["-mmt=4"], "tar parallel");
-    check(&tar_path, &["-mmt=1"], "tar sequential");
+    check("x", &tar_path, &["-mmt=4"], "tar parallel", true);
+    check("x", &tar_path, &["-mmt=1"], "tar sequential", false);
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
     gz.write_all(&tar_bytes).unwrap();
     let tgz_path = sandbox.join("slip.tar.gz");
     fs::write(&tgz_path, gz.finish().unwrap()).unwrap();
-    check(&tgz_path, &[], "tar.gz");
+    check("x", &tgz_path, &[], "tar.gz", false);
 
     // ZIP, including an absolute name.
     let zip_path = sandbox.join("slip.zip");
@@ -559,8 +566,9 @@ fn test_extraction_rejects_path_traversal() {
         }
         zip.finish().unwrap();
     }
-    check(&zip_path, &["-mmt=4"], "zip parallel");
-    check(&zip_path, &["-mmt=1"], "zip sequential");
+    check("x", &zip_path, &["-mmt=4"], "zip parallel", true);
+    check("e", &zip_path, &["-mmt=4"], "zip flat", true);
+    check("x", &zip_path, &["-mmt=1"], "zip sequential", true);
 
     // 7z, sequential and pipelined extraction.
     let sz_path = sandbox.join("slip.7z");
@@ -581,8 +589,9 @@ fn test_extraction_rejects_path_traversal() {
         }
         writer.finish().unwrap();
     }
-    check(&sz_path, &["-mmt=4"], "7z pipelined");
-    check(&sz_path, &["-mmt=1"], "7z sequential");
+    check("x", &sz_path, &["-mmt=4"], "7z pipelined", true);
+    check("e", &sz_path, &["-mmt=4"], "7z flat", true);
+    check("x", &sz_path, &["-mmt=1"], "7z sequential", true);
 
     let _ = fs::remove_dir_all(&sandbox);
 }
@@ -1174,4 +1183,28 @@ fn test_7z_parallel_roundtrip() {
     let _ = fs::remove_dir_all(test_dir);
     let _ = fs::remove_dir_all("out_7z_parallel");
     let _ = fs::remove_file("archive_parallel.7z");
+}
+
+// ─── Path traversal: rooted names ───────────────────────────────────────────
+
+#[test]
+fn test_rooted_entry_extracts_inside_output_dir() {
+    // A leading separator is dropped (as 7-Zip and GNU tar do), so the entry
+    // lands inside the output directory instead of being refused.
+    let dir = "test_slip_rooted";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let archive = format!("{dir}/rooted.tar");
+    fs::write(&archive, tar_with_raw_names(&[("/rooted.txt", b"rooted")])).unwrap();
+
+    let out = format!("{dir}/out");
+    let exe = env!("CARGO_BIN_EXE_openarchive");
+    let status = Command::new(exe)
+        .args(["x", &archive, "-o", &out, "-mmt=1"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(fs::read(format!("{out}/rooted.txt")).unwrap(), b"rooted");
+
+    let _ = fs::remove_dir_all(dir);
 }

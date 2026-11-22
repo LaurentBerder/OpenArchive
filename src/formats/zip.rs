@@ -10,6 +10,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::core::io as file_io;
+use crate::core::paths;
 use crate::core::{ArchiveEntry, ArchiveReader, ArchiveWriter, CompressionOptions, ExtractOptions};
 
 /// Target uncompressed size of one parallel ZIP batch. The compressed batch is
@@ -185,9 +186,8 @@ impl ArchiveReader for ZipHandler {
                 }
             }
 
-            let Some(target_path) = file_io::entry_target(&options.output_dir, name, options.flat)
+            let Some(target_path) = paths::entry_target(&options.output_dir, name, options.flat)?
             else {
-                file_io::warn_unsafe_entry(name);
                 continue;
             };
 
